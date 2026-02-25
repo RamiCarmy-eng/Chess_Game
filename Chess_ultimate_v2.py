@@ -1,0 +1,1077 @@
+import tkinter as tk
+from tkinter import messagebox, simpledialog, font as tkfont
+import chess
+import chess.engine
+import threading
+from pathlib import Path
+import pyttsx3
+import winsound
+import json
+import time
+
+try:
+    import tksvg
+    HAS_TKSVG = True
+except ImportError:
+    HAS_TKSVG = False
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+PIECES_FOLDER = Path("pieces")
+ENGINE_PATH   = Path("stockfish/stockfish-windows-x86-64-avx2.exe")
+STATS_FILE    = "chess_stats.json"
+
+# ── Opening book (ECO prefix table) ───────────────────────────────────────────
+OPENINGS = {
+    "e4":               "King's Pawn Opening",
+    "e4 e5":            "Open Game",
+    "e4 e5 Nf3":        "King's Knight Opening",
+    "e4 e5 Nf3 Nc6 Bb5":"Ruy López",
+    "e4 e5 Nf3 Nc6 Bc4":"Italian Game",
+    "e4 e5 Nf3 Nc6 d4": "Scotch Game",
+    "e4 e5 Nf3 f5":     "Latvian Gambit",
+    "e4 c5":            "Sicilian Defence",
+    "e4 c5 Nf3 d6 d4":  "Sicilian – Open",
+    "e4 c5 Nc3":        "Sicilian – Closed",
+    "e4 e6":            "French Defence",
+    "e4 c6":            "Caro–Kann Defence",
+    "e4 d5":            "Scandinavian Defence",
+    "e4 Nf6":           "Alekhine's Defence",
+    "d4":               "Queen's Pawn Opening",
+    "d4 d5":            "Closed Game",
+    "d4 d5 c4":         "Queen's Gambit",
+    "d4 d5 c4 e6":      "Queen's Gambit Declined",
+    "d4 d5 c4 c6":      "Slav Defence",
+    "d4 Nf6":           "Indian Defence",
+    "d4 Nf6 c4 g6":     "King's Indian Defence",
+    "d4 Nf6 c4 e6 Nf3": "Nimzo / Queen's Indian",
+    "d4 Nf6 c4 e6 Nc3 Bb4":"Nimzo-Indian Defence",
+    "c4":               "English Opening",
+    "Nf3":              "Réti Opening",
+    "g3":               "King's Fianchetto Opening",
+    "b3":               "Nimzowitsch–Larsen Attack",
+    "f4":               "Bird's Opening",
+}
+
+def detect_opening(board: chess.Board) -> str:
+    """Return the best matching opening name for the current move stack."""
+    moves = list(board.move_stack)
+    tmp = chess.Board()
+    san_list = []
+    for m in moves:
+        san_list.append(tmp.san(m))
+        tmp.push(m)
+    # Walk backwards from longest prefix to shortest
+    for length in range(len(san_list), 0, -1):
+        key = " ".join(san_list[:length])
+        if key in OPENINGS:
+            return OPENINGS[key]
+    return ""
+
+
+# ── Sound helpers (pure winsound – no extra deps) ─────────────────────────────
+def _beep(freq, dur):
+    """Non-blocking beep."""
+    threading.Thread(target=lambda: winsound.Beep(freq, dur), daemon=True).start()
+
+def sound_move():    _beep(1050, 60)
+def sound_capture(): _beep(600,  100); time.sleep(0.08); _beep(450, 80)
+def sound_check():   _beep(1400, 80);  time.sleep(0.09); _beep(1400, 80)
+def sound_castle():  _beep(900,  70);  time.sleep(0.07); _beep(1100, 70)
+def sound_end():     _beep(500,  200); time.sleep(0.25); _beep(400,  300)
+
+
+# ── Main application ───────────────────────────────────────────────────────────
+class ChessUltimate:
+    SQ  = 85          # square pixel size
+    PAD = 20          # board left/top padding inside canvas
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("♟ Chess Master Ultimate")
+        self.root.geometry("1120x980")
+        self.root.configure(bg="#1a1a2e")
+        self.root.resizable(False, False)
+
+        # ── State ─────────────────────────────────────────────────────────────
+        self.stats        = self.load_stats()
+        self.player_name  = self.ask_name()
+        self.board        = chess.Board()
+        self.engine       = None
+        self.skill_level  = 5
+        self.selected_sq  = None
+        self.legal_targets= set()
+        self.last_move    = None
+        self.piece_images = {}
+        self.eval_score   = 0.0        # centipawns, white perspective
+        self.opening_name = ""
+        self.move_history = []         # list of SAN strings
+        self.captured_w   = []         # pieces captured by white (black pieces lost)
+        self.captured_b   = []         # pieces captured by black
+        self.review_mode  = False
+        self.review_idx   = 0
+        self.review_boards= []         # board FEN snapshots after each move
+        self.engine_busy  = False
+
+        # ── Coach ─────────────────────────────────────────────────────────────
+        self.coach_on         = True          # can be toggled
+        self.pre_move_eval    = 0.0           # eval BEFORE player moves (cp, white pov)
+        self.best_move_before = None          # engine's best move before player moves
+        self.coach_highlight  = None          # (from_sq, to_sq) to draw in green
+
+        # ── Clocks ────────────────────────────────────────────────────────────
+        self.white_time = 600.0
+        self.black_time = 600.0
+        self.last_tick  = time.time()
+
+        # ── Speech ────────────────────────────────────────────────────────────
+        self.speech = pyttsx3.init()
+        self.speech.setProperty("rate", 160)
+
+        # ── Build UI ──────────────────────────────────────────────────────────
+        self.init_engine()
+        self.create_ui()
+        self.load_piece_images()
+        self.update_clock()
+        self.root.after(150, self.redraw)
+        self.root.after(500, lambda: threading.Thread(
+            target=self._analyse_before_player_move, daemon=True).start())
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Persistence
+    # ──────────────────────────────────────────────────────────────────────────
+    def load_stats(self):
+        if Path(STATS_FILE).exists():
+            with open(STATS_FILE) as f:
+                return json.load(f)
+        return {"wins": 0, "losses": 0, "draws": 0}
+
+    def save_stats(self):
+        with open(STATS_FILE, "w") as f:
+            json.dump(self.stats, f)
+
+    def ask_name(self):
+        n = simpledialog.askstring("Welcome", "Enter your name:", initialvalue="Player 1")
+        return n if n else "Player 1"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Engine
+    # ──────────────────────────────────────────────────────────────────────────
+    def init_engine(self):
+        if ENGINE_PATH.exists():
+            try:
+                self.engine = chess.engine.SimpleEngine.popen_uci(str(ENGINE_PATH))
+                self.engine.configure({"Skill Level": self.skill_level})
+            except Exception as e:
+                print(f"Engine failed: {e}")
+
+    def set_difficulty(self, level):
+        self.skill_level = level
+        if self.engine:
+            self.engine.configure({"Skill Level": level})
+        label = {0: "Easy", 10: "Medium", 20: "Pro"}.get(level, str(level))
+        self.diff_label.config(text=f"Level: {label}")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # UI construction
+    # ──────────────────────────────────────────────────────────────────────────
+    def create_ui(self):
+        BG   = "#1a1a2e"
+        GOLD = "#f1c40f"
+        FG   = "#ecf0f1"
+        ACCENT = "#16213e"
+
+        # ── Top bar ───────────────────────────────────────────────────────────
+        top = tk.Frame(self.root, bg=BG)
+        top.pack(fill=tk.X, padx=20, pady=(8, 2))
+
+        self.stats_label = tk.Label(top,
+            text=self._stats_text(), fg=GOLD, bg=BG, font=("Consolas", 12, "bold"))
+        self.stats_label.pack(side=tk.LEFT)
+
+        self.diff_label = tk.Label(top, text="Level: 5", fg=FG, bg=BG, font=("Consolas", 11))
+        self.diff_label.pack(side=tk.RIGHT)
+
+        self.opening_label = tk.Label(top, text="", fg="#95a5a6", bg=BG, font=("Consolas", 10, "italic"))
+        self.opening_label.pack(side=tk.LEFT, padx=20)
+
+        # ── Clocks ────────────────────────────────────────────────────────────
+        clk = tk.Frame(self.root, bg=BG)
+        clk.pack(fill=tk.X, padx=50, pady=2)
+        self.w_clock = tk.Label(clk, text="10:00", font=("Consolas", 22, "bold"), fg="#2ecc71", bg=BG)
+        self.w_clock.pack(side=tk.LEFT)
+        self.b_clock = tk.Label(clk, text="10:00", font=("Consolas", 22, "bold"), fg="#e74c3c", bg=BG)
+        self.b_clock.pack(side=tk.RIGHT)
+
+        # ── Main row: eval bar + board + right panel ───────────────────────────
+        main_row = tk.Frame(self.root, bg=BG)
+        main_row.pack(padx=10, pady=4)
+
+        # Eval bar (10px wide, 680px tall)
+        eval_col = tk.Frame(main_row, bg=BG)
+        eval_col.pack(side=tk.LEFT, padx=(0, 8), anchor="n")
+        self.eval_canvas = tk.Canvas(eval_col, width=22, height=self.SQ * 8,
+                                     bg="#2c2c2c", highlightthickness=1,
+                                     highlightbackground="#555")
+        self.eval_canvas.pack()
+        self.eval_label = tk.Label(eval_col, text="0.0", fg=FG, bg=BG, font=("Consolas", 9))
+        self.eval_label.pack(pady=2)
+
+        # Board canvas
+        board_col = tk.Frame(main_row, bg=BG)
+        board_col.pack(side=tk.LEFT)
+
+        # Rank/file labels around the board
+        rank_labels_left = tk.Frame(board_col, bg=BG)
+        rank_labels_left.grid(row=1, column=0)
+        for i, r in enumerate("87654321"):
+            tk.Label(rank_labels_left, text=r, fg="#7f8c8d", bg=BG,
+                     font=("Consolas", 9), width=2,
+                     height=1).pack(pady=(self.SQ // 2 - 6, self.SQ // 2 - 7))
+
+        self.canvas = tk.Canvas(board_col, width=self.SQ * 8, height=self.SQ * 8,
+                                bg="#2c3e50", highlightthickness=2,
+                                highlightbackground="#4a4a6a")
+        self.canvas.grid(row=1, column=1)
+        self.canvas.bind("<Button-1>", self.on_click)
+
+        file_frame = tk.Frame(board_col, bg=BG)
+        file_frame.grid(row=2, column=1)
+        for ch in "abcdefgh":
+            tk.Label(file_frame, text=ch, fg="#7f8c8d", bg=BG,
+                     font=("Consolas", 9), width=int(self.SQ / 7)).pack(side=tk.LEFT)
+
+        # Captured pieces strips
+        cap_frame = tk.Frame(board_col, bg=BG)
+        cap_frame.grid(row=0, column=1, sticky="w")
+        tk.Label(cap_frame, text="Black lost:", fg="#95a5a6", bg=BG,
+                 font=("Consolas", 9)).pack(side=tk.LEFT)
+        self.cap_black_label = tk.Label(cap_frame, text="", fg="#ecf0f1", bg=BG,
+                                        font=("Arial", 11))
+        self.cap_black_label.pack(side=tk.LEFT)
+
+        cap_frame2 = tk.Frame(board_col, bg=BG)
+        cap_frame2.grid(row=3, column=1, sticky="w")
+        tk.Label(cap_frame2, text="White lost:", fg="#95a5a6", bg=BG,
+                 font=("Consolas", 9)).pack(side=tk.LEFT)
+        self.cap_white_label = tk.Label(cap_frame2, text="", fg="#ecf0f1", bg=BG,
+                                        font=("Arial", 11))
+        self.cap_white_label.pack(side=tk.LEFT)
+
+        # ── Right panel ───────────────────────────────────────────────────────
+        right = tk.Frame(main_row, bg=ACCENT, relief="flat", bd=0)
+        right.pack(side=tk.LEFT, padx=(12, 0), fill=tk.Y)
+
+        tk.Label(right, text="MOVE HISTORY", fg=GOLD, bg=ACCENT,
+                 font=("Consolas", 10, "bold")).pack(pady=(8, 2))
+
+        hist_frame = tk.Frame(right, bg=ACCENT)
+        hist_frame.pack(fill=tk.BOTH, expand=True, padx=6)
+
+        scrollbar = tk.Scrollbar(hist_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.hist_list = tk.Listbox(hist_frame, width=22, height=28,
+                                    bg="#0f0f23", fg=FG, selectbackground="#273c75",
+                                    font=("Consolas", 10), yscrollcommand=scrollbar.set,
+                                    highlightthickness=0, bd=0)
+        self.hist_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.hist_list.yview)
+
+        # ── Coach panel ───────────────────────────────────────────────────────
+        tk.Frame(right, bg="#0a0a1a", height=2).pack(fill=tk.X, padx=6, pady=(8,4))
+
+        coach_hdr = tk.Frame(right, bg=ACCENT)
+        coach_hdr.pack(fill=tk.X, padx=6)
+        tk.Label(coach_hdr, text="🎓 COACH", fg="#27ae60", bg=ACCENT,
+                 font=("Consolas", 10, "bold")).pack(side=tk.LEFT)
+        self.coach_toggle_btn = tk.Button(
+            coach_hdr, text="ON", bg="#27ae60", fg="white",
+            font=("Consolas", 8, "bold"), relief="flat", padx=6, pady=1,
+            cursor="hand2", command=self.toggle_coach)
+        self.coach_toggle_btn.pack(side=tk.RIGHT)
+
+        coach_msg_frame = tk.Frame(right, bg="#0d1117", relief="flat")
+        coach_msg_frame.pack(fill=tk.X, padx=6, pady=(2, 6))
+
+        self.coach_text = tk.Text(
+            coach_msg_frame, width=22, height=8,
+            bg="#0d1117", fg="#a8d8a8",
+            font=("Consolas", 9), wrap=tk.WORD,
+            relief="flat", padx=6, pady=4,
+            state=tk.DISABLED, cursor="arrow")
+        self.coach_text.pack(fill=tk.BOTH)
+
+        # Tag styles for coach messages
+        self.coach_text.tag_config("good",    foreground="#2ecc71")
+        self.coach_text.tag_config("warn",    foreground="#f39c12")
+        self.coach_text.tag_config("blunder", foreground="#e74c3c")
+        self.coach_text.tag_config("info",    foreground="#95a5a6")
+        self.coach_text.tag_config("tip",     foreground="#3498db")
+
+        self._coach_msg("Hi! I'll guide you during the game.\nMake your first move! ♟", "info")
+
+        # ── Bottom buttons ────────────────────────────────────────────────────
+        btm = tk.Frame(self.root, bg=BG)
+        btm.pack(pady=8)
+
+        def btn(parent, text, cmd, color="#34495e"):
+            return tk.Button(parent, text=text, command=cmd, bg=color, fg="white",
+                             font=("Consolas", 10, "bold"), relief="flat", padx=10, pady=4,
+                             cursor="hand2", activebackground="#5d6d7e", activeforeground="white")
+
+        btn(btm, "↩  Undo",        self.undo_move,   "#e67e22").pack(side=tk.LEFT, padx=6)
+        btn(btm, "Easy",            lambda: self.set_difficulty(0)).pack(side=tk.LEFT, padx=4)
+        btn(btm, "Medium",          lambda: self.set_difficulty(10)).pack(side=tk.LEFT, padx=4)
+        btn(btm, "Pro",             lambda: self.set_difficulty(20)).pack(side=tk.LEFT, padx=4)
+        btn(btm, "⟳  New Game",    self.new_game,    "#27ae60").pack(side=tk.LEFT, padx=6)
+        btn(btm, "▶  Review Game", self.start_review,"#8e44ad").pack(side=tk.LEFT, padx=6)
+
+        # Review nav (hidden until review mode)
+        self.review_frame = tk.Frame(self.root, bg=BG)
+        btn(self.review_frame, "◀◀ Start", lambda: self.review_jump(0),   "#2c3e50").pack(side=tk.LEFT, padx=4)
+        btn(self.review_frame, "◀ Prev",  lambda: self.review_step(-1),  "#2c3e50").pack(side=tk.LEFT, padx=4)
+        btn(self.review_frame, "▶ Next",  lambda: self.review_step(+1),  "#2c3e50").pack(side=tk.LEFT, padx=4)
+        btn(self.review_frame, "▶▶ End",  lambda: self.review_jump(-1),  "#2c3e50").pack(side=tk.LEFT, padx=4)
+        btn(self.review_frame, "✕ Exit Review", self.exit_review, "#c0392b").pack(side=tk.LEFT, padx=8)
+
+        # Status bar
+        self.status_var = tk.StringVar(value="Your turn – White")
+        tk.Label(self.root, textvariable=self.status_var, fg="#bdc3c7", bg=BG,
+                 font=("Consolas", 10)).pack(pady=(0, 6))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Piece images
+    # ──────────────────────────────────────────────────────────────────────────
+    def load_piece_images(self):
+        MAP = {'K':'wk','Q':'wq','R':'wr','B':'wb','N':'wn','P':'wp',
+               'k':'bk','q':'bq','r':'br','b':'bb','n':'bn','p':'bp'}
+        if HAS_TKSVG:
+            for sym, fname in MAP.items():
+                p = PIECES_FOLDER / f"{fname}.svg"
+                if p.exists():
+                    self.piece_images[sym] = tksvg.SvgImage(
+                        file=str(p), scaletoheight=int(self.SQ * 0.84))
+        # If no SVG images loaded, we fall back to Unicode rendering in draw_pieces
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Clock
+    # ──────────────────────────────────────────────────────────────────────────
+    def update_clock(self):
+        now = time.time()
+        dt  = now - self.last_tick
+        self.last_tick = now
+
+        if not self.board.is_game_over() and not self.review_mode:
+            if self.board.turn == chess.WHITE:
+                self.white_time = max(0.0, self.white_time - dt)
+            else:
+                self.black_time = max(0.0, self.black_time - dt)
+
+        self.w_clock.config(text=self._fmt(self.white_time))
+        self.b_clock.config(text=self._fmt(self.black_time))
+        self.root.after(200, self.update_clock)
+
+    def _fmt(self, s):
+        m, sec = divmod(int(s), 60)
+        return f"{m:02d}:{sec:02d}"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Drawing
+    # ──────────────────────────────────────────────────────────────────────────
+    def redraw(self):
+        self.canvas.delete("all")
+        self.draw_squares()
+        self.draw_legal_dots()
+        self.draw_coach_highlight()
+        self.draw_pieces()
+        self.draw_eval_bar()
+        self.update_captured_display()
+
+    def sq_xy(self, sq):
+        """Top-left pixel of a square."""
+        c = chess.square_file(sq)
+        r = 7 - chess.square_rank(sq)
+        return c * self.SQ, r * self.SQ
+
+    def draw_squares(self):
+        LIGHT  = "#EBECD0"
+        DARK   = "#779556"
+        LAST   = "#F7F769"
+        SEL    = "#66B2FF"
+        CHECK  = "#FF4444"
+
+        in_check_sq = None
+        if self.board.is_check():
+            in_check_sq = self.board.king(self.board.turn)
+
+        for sq in chess.SQUARES:
+            c = chess.square_file(sq)
+            r = 7 - chess.square_rank(sq)
+            x0, y0 = c * self.SQ, r * self.SQ
+            x1, y1 = x0 + self.SQ, y0 + self.SQ
+
+            color = LIGHT if (c + chess.square_rank(sq)) % 2 else DARK
+
+            if self.last_move and sq in (self.last_move.from_square, self.last_move.to_square):
+                color = LAST
+            if self.selected_sq == sq:
+                color = SEL
+            if sq == in_check_sq:
+                color = CHECK
+
+            self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
+
+    def draw_legal_dots(self):
+        """Draw small dots on legal target squares for the selected piece."""
+        for sq in self.legal_targets:
+            x0, y0 = self.sq_xy(sq)
+            cx, cy  = x0 + self.SQ // 2, y0 + self.SQ // 2
+            has_piece = self.board.piece_at(sq) is not None
+            if has_piece:
+                # Ring around the target
+                r = self.SQ // 2 - 4
+                self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                        outline="#444444", width=5, fill="")
+            else:
+                # Small dot
+                r = self.SQ // 7
+                self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                        fill="#555555", outline="")
+
+    # Unicode fallback glyphs
+    UNICODE_PIECES = {
+        'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
+        'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟',
+    }
+
+    def draw_pieces(self):
+        use_svg = bool(self.piece_images)
+        piece_font_size = int(self.SQ * 0.72)
+
+        for sq in chess.SQUARES:
+            piece = self.board.piece_at(sq)
+            if not piece:
+                continue
+            x0, y0 = self.sq_xy(sq)
+            cx = x0 + self.SQ // 2
+            cy = y0 + self.SQ // 2
+
+            if use_svg:
+                # Drop shadow
+                self.canvas.create_oval(cx - 18, cy + 16, cx + 18, cy + 24,
+                                        fill="#333333", outline="")
+                img = self.piece_images.get(piece.symbol())
+                if img:
+                    self.canvas.create_image(cx, cy, image=img)
+            else:
+                # Unicode fallback – draw a coloured circle + glyph
+                sym   = piece.symbol()
+                glyph = self.UNICODE_PIECES.get(sym, sym)
+                is_white = piece.color == chess.WHITE
+
+                # Shadow
+                self.canvas.create_oval(cx - 28, cy - 28, cx + 28, cy + 30,
+                                        fill="#333333", outline="")
+                # Piece circle
+                fill_color   = "#f5f0e8" if is_white else "#2d2d2d"
+                border_color = "#999" if is_white else "#111"
+                self.canvas.create_oval(cx - 28, cy - 30, cx + 28, cy + 26,
+                                        fill=fill_color, outline=border_color, width=2)
+                # Glyph
+                text_color = "#1a1a1a" if is_white else "#e8e8e8"
+                self.canvas.create_text(cx, cy - 2,
+                                        text=glyph,
+                                        fill=text_color,
+                                        font=("Segoe UI Symbol", piece_font_size // 3, "bold"))
+
+    def draw_eval_bar(self):
+        """White share at top → 50% = equal, 100% = white winning."""
+        self.eval_canvas.delete("all")
+        h = self.SQ * 8
+        w = 22
+        # Clamp eval to ±8 pawns
+        clamped = max(-8.0, min(8.0, self.eval_score / 100.0))
+        white_frac = (clamped + 8) / 16.0   # 0..1  (1 = white winning)
+        black_height = int(h * (1 - white_frac))
+        white_height = h - black_height
+
+        self.eval_canvas.create_rectangle(0, 0, w, black_height,
+                                          fill="#2c2c2c", outline="")
+        self.eval_canvas.create_rectangle(0, black_height, w, h,
+                                          fill="#f0f0f0", outline="")
+        # Centre line
+        self.eval_canvas.create_line(0, h // 2, w, h // 2, fill="#888", width=1)
+
+        score_pawn = self.eval_score / 100.0
+        sign = "+" if score_pawn > 0 else ""
+        self.eval_label.config(text=f"{sign}{score_pawn:.1f}")
+
+    def update_captured_display(self):
+        UNICODE = {'P':'♟','N':'♞','B':'♝','R':'♜','Q':'♛',
+                   'p':'♙','n':'♘','b':'♗','r':'♖','q':'♕'}
+        self.cap_black_label.config(
+            text=" ".join(UNICODE.get(p, p) for p in self.captured_w))
+        self.cap_white_label.config(
+            text=" ".join(UNICODE.get(p, p) for p in self.captured_b))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Coach
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Piece values in centipawns
+    PIECE_VALUE = {
+        chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
+        chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 0
+    }
+    PIECE_NAME = {
+        chess.PAWN: "pawn", chess.KNIGHT: "knight", chess.BISHOP: "bishop",
+        chess.ROOK: "rook", chess.QUEEN: "queen", chess.KING: "king"
+    }
+
+    def toggle_coach(self):
+        self.coach_on = not self.coach_on
+        if self.coach_on:
+            self.coach_toggle_btn.config(text="ON",  bg="#27ae60")
+            self._coach_msg("Coach is ON. I'll help you!", "good")
+            self.coach_speak("Coach is ON. I will help you!")
+        else:
+            self.coach_toggle_btn.config(text="OFF", bg="#7f8c8d")
+            self._coach_msg("Coach is OFF.", "info")
+            self.coach_speak("Coach is off.")
+        self.coach_highlight = None
+        self.redraw()
+
+    def _coach_msg(self, text: str, tag: str = "info"):
+        """Replace the coach panel text."""
+        self.coach_text.config(state=tk.NORMAL)
+        self.coach_text.delete("1.0", tk.END)
+        self.coach_text.insert(tk.END, text, tag)
+        self.coach_text.config(state=tk.DISABLED)
+
+    def _analyse_before_player_move(self):
+        """Run in background thread BEFORE player's move to capture baseline."""
+        if not self.engine or not self.coach_on:
+            return
+        try:
+            info = self.engine.analyse(self.board, chess.engine.Limit(depth=12))
+            score = info["score"].white()
+            self.pre_move_eval = float(score.score(mate_score=3000) or 0)
+            self.best_move_before = info.get("pv", [None])[0]
+        except Exception:
+            self.pre_move_eval    = 0.0
+            self.best_move_before = None
+
+    def analyse_player_move(self, move: chess.Move, board_before: chess.Board):
+        """
+        Thorough coaching: comment on EVERY move with explanation.
+        Compares pre-move eval to post-move eval via Stockfish.
+        """
+        if not self.engine or not self.coach_on:
+            return
+        try:
+            info_after = self.engine.analyse(self.board, chess.engine.Limit(depth=14))
+            score_after = info_after["score"].white()
+            post_eval = float(score_after.score(mate_score=3000) or 0)
+        except Exception:
+            return
+
+        drop = self.pre_move_eval - post_eval   # positive = white lost centipawns
+        best = self.best_move_before
+        player_played_best = (best is not None and move == best)
+
+        # ── Grade the move ────────────────────────────────────────────────────
+        if player_played_best:
+            grade = "best";     tag = "good"
+        elif drop >= 250:
+            grade = "blunder";  tag = "blunder"
+        elif drop >= 100:
+            grade = "mistake";  tag = "warn"
+        elif drop >= 40:
+            grade = "inaccuracy"; tag = "warn"
+        elif drop >= 10:
+            grade = "slight";   tag = "tip"
+        else:
+            grade = "good";     tag = "good"
+
+        # ── Header line ───────────────────────────────────────────────────────
+        headers = {
+            "best":       "✅ Best move! Well done!",
+            "good":       "👍 Good move!",
+            "slight":     "💡 Slightly better options exist.",
+            "inaccuracy": "💡 Inaccuracy – a better move was available.",
+            "mistake":    "⚠️ Mistake – you gave up advantage.",
+            "blunder":    f"❌ Blunder! You lost ~{abs(drop)//100} pawn(s) of advantage.",
+        }
+        msg_lines = [headers[grade]]
+
+        # ── Detailed tactical explanations (ALL moves) ────────────────────────
+        tips = self._explain_move_thorough(move, board_before, drop, best)
+        msg_lines.extend(tips)
+
+        # ── Show better move ──────────────────────────────────────────────────
+        show_best = grade not in ("best", "good")
+        if show_best and best is not None:
+            try:
+                best_san = board_before.san(best)
+                msg_lines.append(f"\n🔵 Better: {best_san}")
+                self.coach_highlight = (best.from_square, best.to_square)
+            except Exception:
+                self.coach_highlight = None
+        else:
+            self.coach_highlight = None
+
+        msg = "\n".join(msg_lines)
+        self.root.after(0, lambda: self._coach_msg(msg, tag))
+        self.root.after(0, self.redraw)
+
+        # Speak every coach comment (thorough mode)
+        if self.coach_on:
+            # Build a speakable version: first line + first tip (if any)
+            speakable_lines = [msg_lines[0]]
+            if len(msg_lines) > 1:
+                tip = msg_lines[1].lstrip("⚠💰🎯👑🏰📌👌💥💡 ")
+                if tip:
+                    speakable_lines.append(tip)
+            spoken = ". ".join(speakable_lines).lstrip("✅👍💡⚠️❌🔵 ")
+            self.root.after(0, lambda s=spoken: self.coach_speak("Coach says: " + s))
+
+    def _explain_move_thorough(self, move: chess.Move, board: chess.Board,
+                                drop: float, best: chess.Move) -> list:
+        """
+        Thorough mode: generate tips for EVERY move, not just bad ones.
+        Returns a list of tip strings.
+        """
+        tips = []
+        board_after = board.copy()
+        board_after.push(move)
+        moved_piece = board_after.piece_at(move.to_square)
+        piece_moved = board.piece_at(move.from_square)
+
+        # ── 1. Hung a piece (undefended after move) ───────────────────────────
+        if moved_piece and moved_piece.color == chess.WHITE:
+            attackers = board_after.attackers(chess.BLACK, move.to_square)
+            defenders = board_after.attackers(chess.WHITE, move.to_square)
+            if attackers and not defenders:
+                pname = self.PIECE_NAME.get(moved_piece.piece_type, "piece")
+                sq_name = chess.square_name(move.to_square)
+                tips.append(f"⚠ Your {pname} on {sq_name} is undefended — the opponent can take it!")
+
+        # ── 2. Left a piece hanging that was previously defended ──────────────
+        if piece_moved:
+            for sq in chess.SQUARES:
+                p = board.piece_at(sq)
+                if p and p.color == chess.WHITE and sq != move.from_square:
+                    was_defended = bool(board.attackers(chess.WHITE, sq))
+                    now_defended = bool(board_after.attackers(chess.WHITE, sq))
+                    now_attacked = bool(board_after.attackers(chess.BLACK, sq))
+                    if now_attacked and not now_defended and was_defended:
+                        pname = self.PIECE_NAME.get(p.piece_type, "piece")
+                        tips.append(f"⚠ Moving away left your {pname} on {chess.square_name(sq)} undefended!")
+                        break
+
+        # ── 3. Missed a free capture ──────────────────────────────────────────
+        if best is not None and board.is_capture(best) and not board.is_capture(move):
+            captured = board.piece_at(best.to_square)
+            if captured:
+                pname = self.PIECE_NAME.get(captured.piece_type, "piece")
+                tips.append(f"💰 You could have captured the opponent's {pname} for free!")
+
+        # ── 4. Missed check ───────────────────────────────────────────────────
+        if best is not None:
+            test2 = board.copy(); test2.push(best)
+            if test2.is_check() and not board_after.is_check():
+                tips.append("🎯 The better move would have put the King in check!")
+
+        # ── 5. Missed checkmate ───────────────────────────────────────────────
+        if best is not None:
+            test3 = board.copy(); test3.push(best)
+            if test3.is_checkmate():
+                tips.append("👑 You missed a CHECKMATE! Look for that next time!")
+
+        # ── 6. King safety: moved king before castling ────────────────────────
+        if piece_moved and piece_moved.piece_type == chess.KING:
+            if board.has_castling_rights(chess.WHITE):
+                tips.append("🏰 Tip: You lost your castling rights! Castling keeps your King safe behind pawns.")
+
+        # ── 7. Pawn structure tip ─────────────────────────────────────────────
+        if piece_moved and piece_moved.piece_type == chess.PAWN:
+            # Doubled pawns
+            col = chess.square_file(move.to_square)
+            pawns_on_col = sum(1 for sq in chess.SQUARES
+                               if board_after.piece_at(sq) and
+                               board_after.piece_at(sq).piece_type == chess.PAWN and
+                               board_after.piece_at(sq).color == chess.WHITE and
+                               chess.square_file(sq) == col)
+            if pawns_on_col >= 2:
+                tips.append("📌 Tip: You now have doubled pawns on the same file — they can be weak.")
+
+        # ── 8. Positive: good development in opening ─────────────────────────
+        move_count = len(board.move_stack)
+        if move_count <= 10 and piece_moved:
+            if piece_moved.piece_type in (chess.KNIGHT, chess.BISHOP):
+                if not tips:   # only if no warnings
+                    tips.append("👌 Good — developing your pieces early is the right idea!")
+            if piece_moved.piece_type == chess.PAWN and drop < 20:
+                from_rank = chess.square_rank(move.from_square)
+                if from_rank == 1 and chess.square_rank(move.to_square) == 3:
+                    if not tips:
+                        tips.append("👌 Good central pawn push — controlling the centre!")
+
+        # ── 9. Positive: good capture ─────────────────────────────────────────
+        if board.is_capture(move) and drop < 10:
+            captured = board.piece_at(move.to_square)
+            if captured:
+                cap_val  = self.PIECE_VALUE.get(captured.piece_type, 0)
+                mover_val = self.PIECE_VALUE.get(piece_moved.piece_type, 0) if piece_moved else 0
+                if cap_val >= mover_val and not tips:
+                    tips.append(f"💥 Nice capture! You traded well.")
+
+        # ── 10. Positive: castled ─────────────────────────────────────────────
+        if board.is_castling(move) and not tips:
+            tips.append("🏰 Great — castling keeps your King safe and connects your Rooks!")
+
+        return tips
+
+    def draw_coach_highlight(self):
+        """Draw green arrow/highlight for the suggested best move."""
+        if not self.coach_highlight or not self.coach_on:
+            return
+        from_sq, to_sq = self.coach_highlight
+        fx, fy = self.sq_xy(from_sq)
+        tx, ty = self.sq_xy(to_sq)
+        fcx, fcy = fx + self.SQ // 2, fy + self.SQ // 2
+        tcx, tcy = tx + self.SQ // 2, ty + self.SQ // 2
+        # Highlight squares in blue-green
+        self.canvas.create_rectangle(fx, fy, fx + self.SQ, fy + self.SQ,
+                                     outline="#00c896", width=4, fill="")
+        self.canvas.create_rectangle(tx, ty, tx + self.SQ, ty + self.SQ,
+                                     outline="#00c896", width=4, fill="")
+        # Arrow
+        self.canvas.create_line(fcx, fcy, tcx, tcy,
+                                fill="#00c896", width=3, arrow=tk.LAST,
+                                arrowshape=(14, 18, 6))
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Move history panel
+    # ──────────────────────────────────────────────────────────────────────────
+    def refresh_history(self):
+        self.hist_list.delete(0, tk.END)
+        for i in range(0, len(self.move_history), 2):
+            w_san = self.move_history[i]
+            b_san = self.move_history[i + 1] if i + 1 < len(self.move_history) else ""
+            move_num = i // 2 + 1
+            self.hist_list.insert(tk.END, f"  {move_num:2d}. {w_san:<8} {b_san}")
+        self.hist_list.yview_moveto(1.0)  # scroll to bottom
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Click handler
+    # ──────────────────────────────────────────────────────────────────────────
+    def on_click(self, event):
+        if self.board.turn == chess.BLACK:
+            return
+        if self.board.is_game_over():
+            return
+        if self.review_mode:
+            return
+        if self.engine_busy:
+            return
+
+        col = event.x // self.SQ
+        row = 7 - (event.y // self.SQ)
+        if not (0 <= col <= 7 and 0 <= row <= 7):
+            return
+        sq = chess.square(col, row)
+
+        if self.selected_sq is None:
+            piece = self.board.piece_at(sq)
+            if piece and piece.color == chess.WHITE:
+                self.selected_sq   = sq
+                self.legal_targets = {m.to_square for m in self.board.legal_moves
+                                      if m.from_square == sq}
+                self.redraw()
+        else:
+            move = chess.Move(self.selected_sq, sq)
+            # Auto-promote to queen
+            piece = self.board.piece_at(self.selected_sq)
+            if (piece and piece.piece_type == chess.PAWN
+                    and chess.square_rank(sq) in (0, 7)):
+                move.promotion = chess.QUEEN
+
+            if move in self.board.legal_moves:
+                self.execute_player_move(move)
+            else:
+                # Maybe user clicked a different own piece
+                p2 = self.board.piece_at(sq)
+                if p2 and p2.color == chess.WHITE:
+                    self.selected_sq   = sq
+                    self.legal_targets = {m.to_square for m in self.board.legal_moves
+                                          if m.from_square == sq}
+                    self.redraw()
+                    return
+
+            self.selected_sq   = None
+            self.legal_targets = set()
+            self.redraw()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Move execution
+    # ──────────────────────────────────────────────────────────────────────────
+    def _record_capture(self, move: chess.Move):
+        captured = self.board.piece_at(move.to_square)
+        if self.board.is_en_passant(move):
+            # The pawn is on a different square for EP
+            ep_sq = chess.square(chess.square_file(move.to_square),
+                                 chess.square_rank(move.from_square))
+            captured = self.board.piece_at(ep_sq)
+        if captured:
+            if captured.color == chess.BLACK:
+                self.captured_w.append(captured.symbol())
+            else:
+                self.captured_b.append(captured.symbol())
+
+    def execute_player_move(self, move: chess.Move):
+        san        = self.board.san(move)
+        is_capture = self.board.is_capture(move)
+        is_castle  = self.board.is_castling(move)
+        self._record_capture(move)
+        board_before = self.board.copy()   # snapshot for coach
+
+        self.board.push(move)
+        self.last_move = move
+        self.coach_highlight = None        # clear previous suggestion
+        self.move_history.append(san)
+        self.review_boards.append(self.board.fen())
+        self.refresh_history()
+        self.opening_label.config(text=detect_opening(self.board))
+        self.redraw()
+        self.speak(san)
+
+        if is_castle:       sound_castle()
+        elif is_capture:    sound_capture()
+        elif self.board.is_check(): sound_check()
+        else:               sound_move()
+
+        self.status_var.set("Engine thinking…")
+
+        if self.board.is_game_over():
+            self.handle_end()
+        else:
+            self.engine_busy = True
+            threading.Thread(
+                target=self._engine_and_coach,
+                args=(move, board_before),
+                daemon=True).start()
+
+    def _engine_and_coach(self, player_move: chess.Move, board_before: chess.Board):
+        """Background: run coach analysis, then engine reply."""
+        # Coach analysis (uses board AFTER player move, but compares to pre_move_eval)
+        self.analyse_player_move(player_move, board_before)
+
+        # Engine reply
+        time.sleep(0.2)
+        if self.engine:
+            result = self.engine.play(self.board, chess.engine.Limit(time=0.6))
+            # Update eval
+            try:
+                info = self.engine.analyse(self.board, chess.engine.Limit(depth=10))
+                score = info["score"].white()
+                self.eval_score = float(score.score(mate_score=3000) or 0)
+            except Exception:
+                pass
+            self.root.after(0, lambda: self.execute_engine_move(result.move))
+
+    def execute_engine_move(self, move: chess.Move):
+        self.engine_busy = False
+        san        = self.board.san(move)
+        is_capture = self.board.is_capture(move)
+        is_castle  = self.board.is_castling(move)
+        self._record_capture(move)
+
+        self.board.push(move)
+        self.last_move = move
+        self.move_history.append(san)
+        self.review_boards.append(self.board.fen())
+        self.refresh_history()
+        self.opening_label.config(text=detect_opening(self.board))
+        self.redraw()
+        self.speak(san)
+
+        if is_castle:       sound_castle()
+        elif is_capture:    sound_capture()
+        elif self.board.is_check(): sound_check()
+        else:               sound_move()
+
+        if self.board.is_game_over():
+            self.handle_end()
+        else:
+            self.status_var.set("Your turn – White")
+            # Pre-analyse so coach knows the best move before player picks
+            threading.Thread(target=self._analyse_before_player_move, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Undo
+    # ──────────────────────────────────────────────────────────────────────────
+    def undo_move(self):
+        if self.review_mode:
+            return
+        if len(self.board.move_stack) >= 2:
+            self.board.pop(); self.board.pop()
+            if len(self.move_history) >= 2:
+                self.move_history.pop(); self.move_history.pop()
+            if len(self.review_boards) >= 2:
+                self.review_boards.pop(); self.review_boards.pop()
+            self.last_move   = None
+            self.selected_sq = None
+            self.legal_targets = set()
+            self.coach_highlight = None
+            self.refresh_history()
+            self.redraw()
+            self.speak("Undo")
+            self.status_var.set("Your turn – White")
+            self._coach_msg("Move undone. Let's try again! 💪", "info")
+            threading.Thread(target=self._analyse_before_player_move, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Game over
+    # ──────────────────────────────────────────────────────────────────────────
+    def handle_end(self):
+        sound_end()
+        res = self.board.result()
+        if   res == "1-0": self.stats["wins"]   += 1; msg = f"🏆 You won, {self.player_name}!"
+        elif res == "0-1": self.stats["losses"] += 1; msg = "The engine wins this time."
+        else:              self.stats["draws"]  += 1; msg = "It's a draw."
+        self.save_stats()
+        self.stats_label.config(text=self._stats_text())
+        self.status_var.set(f"Game over – {res}")
+        messagebox.showinfo("Game Over", f"{msg}\n\nResult: {res}")
+
+    def _stats_text(self):
+        return (f"🏆 {self.player_name}:  "
+                f"{self.stats['wins']}W  {self.stats['losses']}L  {self.stats['draws']}D")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # New game
+    # ──────────────────────────────────────────────────────────────────────────
+    def new_game(self):
+        self.board         = chess.Board()
+        self.last_move     = None
+        self.selected_sq   = None
+        self.legal_targets = set()
+        self.eval_score    = 0.0
+        self.move_history  = []
+        self.captured_w    = []
+        self.captured_b    = []
+        self.review_boards = []
+        self.white_time    = 600.0
+        self.black_time    = 600.0
+        self.engine_busy   = False
+        self.coach_highlight = None
+        self.pre_move_eval   = 0.0
+        self.best_move_before = None
+        self.exit_review()
+        self.refresh_history()
+        self.opening_label.config(text="")
+        self.status_var.set("Your turn – White")
+        self._coach_msg("New game! Good luck! ♟\nI'll coach you as you play.", "info")
+        self.redraw()
+        threading.Thread(target=self._analyse_before_player_move, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Review mode
+    # ──────────────────────────────────────────────────────────────────────────
+    def start_review(self):
+        if not self.review_boards:
+            messagebox.showinfo("Review", "No moves to review yet.")
+            return
+        self.review_mode = True
+        self.review_idx  = len(self.review_boards) - 1
+        self.review_frame.pack(pady=4)
+        self.status_var.set("Review mode – use ◀ ▶ to step through moves")
+        self._show_review_pos()
+
+    def exit_review(self):
+        self.review_mode = False
+        self.review_frame.pack_forget()
+        self.board = chess.Board()
+        # Replay all moves to restore live board
+        tmp = chess.Board()
+        for san in self.move_history:
+            try: tmp.push_san(san)
+            except: break
+        self.board = tmp
+        self.redraw()
+
+    def review_step(self, delta: int):
+        if not self.review_mode:
+            return
+        self.review_idx = max(0, min(len(self.review_boards) - 1, self.review_idx + delta))
+        self._show_review_pos()
+
+    def review_jump(self, idx: int):
+        if idx == -1:
+            idx = len(self.review_boards) - 1
+        self.review_idx = max(0, min(len(self.review_boards) - 1, idx))
+        self._show_review_pos()
+
+    def _show_review_pos(self):
+        self.board = chess.Board(self.review_boards[self.review_idx])
+        move_num   = self.review_idx + 1
+        san        = self.move_history[self.review_idx] if self.review_idx < len(self.move_history) else "?"
+        color      = "White" if move_num % 2 == 1 else "Black"
+        self.status_var.set(f"Review: move {move_num} – {color} played {san}")
+        self.last_move = None
+        self.redraw()
+        # Highlight reviewed move on board
+        if self.review_idx > 0:
+            # We need the previous board to know from/to squares
+            prev = chess.Board(self.review_boards[self.review_idx - 1])
+            moves_played = list(prev.legal_moves)
+            # Find which move was made (compare FEN)
+            for m in prev.legal_moves:
+                prev.push(m)
+                if prev.fen() == self.board.fen():
+                    self.last_move = m
+                    break
+                prev.pop()
+        self.redraw()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Speech
+    # ──────────────────────────────────────────────────────────────────────────
+    def speak(self, text: str):
+        """Speak chess SAN notation – replaces piece letters with full names."""
+        readable = (text
+                    .replace('N', 'Knight').replace('B', 'Bishop')
+                    .replace('R', 'Rook').replace('Q', 'Queen')
+                    .replace('K', 'King').replace('x', 'takes')
+                    .replace('+', 'check').replace('#', 'checkmate'))
+        self._say(readable)
+
+    def coach_speak(self, text: str):
+        """Speak plain English coach messages – no letter substitution."""
+        # Strip emoji and symbols that TTS can't pronounce
+        import re
+        clean = re.sub(r'[^\w\s\.,!?\'"-]', '', text)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        self._say(clean)
+
+    def _say(self, text: str):
+        """Non-blocking TTS."""
+        def _run():
+            self.speech.say(text)
+            self.speech.runAndWait()
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    def __del__(self):
+        if self.engine:
+            try: self.engine.quit()
+            except: pass
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    root = tk.Tk()
+    app  = ChessUltimate(root)
+    root.mainloop()
+
+

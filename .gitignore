@@ -1,0 +1,12 @@
+openings/
+stockfish/
+*.pgn
+*.cbv
+*.si4
+*.sg4
+*.exe
+*.bin
+*.dll
+*.zip
+*.tar
+*.gz
