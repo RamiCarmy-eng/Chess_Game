@@ -220,7 +220,6 @@ class ChessUltimate:
         self.pre_move_eval    = 0.0           # eval BEFORE player moves (cp, white pov)
         self.best_move_before = None          # engine's best move before player moves
         self.coach_highlight  = None          # (from_sq, to_sq) to draw in green
-        self.theory_arrows    = []            # list of (from_sq, to_sq, color) for theory display
 
         # ── Clocks ────────────────────────────────────────────────────────────
         self.white_time = 600.0
@@ -473,7 +472,6 @@ class ChessUltimate:
         btn(btm, "Pro",             lambda: self.set_difficulty(20)).pack(side=tk.LEFT, padx=4)
         btn(btm, "⟳  New Game",    self.new_game,    "#27ae60").pack(side=tk.LEFT, padx=6)
         btn(btm, "▶  Review Game", self.start_review,"#8e44ad").pack(side=tk.LEFT, padx=6)
-        btn(btm, "📖 Theory",      self.show_theory,  "#2980b9").pack(side=tk.LEFT, padx=6)
 
         # Review nav (hidden until review mode)
         self.review_frame = tk.Frame(self.root, bg=BG)
@@ -529,7 +527,7 @@ class ChessUltimate:
     # ──────────────────────────────────────────────────────────────────────────
 
     def get_book_suggestions(self):
-        current_moves = " ".join(m.replace("x","").replace("+","").replace("#","") for m in self.move_history)
+        current_moves = " ".join(self.move_history)
         suggestions = []
         # חיפוש כל הפתיחות שמתחילות במהלכים ששיחקת עד עכשיו
         for moves_sequence, name in self.openings.items():
@@ -542,7 +540,7 @@ class ChessUltimate:
 
     def get_theory_moves(self):
         # הופך את היסטוריית המהלכים למחרוזת (למשל "e4 e5")
-        current_sequence = " ".join(m.replace("x","").replace("+","").replace("#","") for m in self.move_history).strip()
+        current_sequence = " ".join(self.move_history).strip()
         theory_suggestions = {}
 
         for moves, name in self.openings.items():
@@ -561,7 +559,6 @@ class ChessUltimate:
         self.draw_squares()
         self.draw_legal_dots()
         self.draw_coach_highlight()
-        self.draw_theory_arrows()
         self.draw_pieces()
         self.draw_eval_bar()
         self.update_captured_display()
@@ -1214,7 +1211,6 @@ class ChessUltimate:
             self.speak_async("Check!")
         self.last_move = move
         self.coach_highlight = None        # clear previous suggestion
-        self.theory_arrows = []             # clear theory arrows on new move
         self.move_history.append(san)
         self.review_boards.append(self.board.fen())
         self.refresh_history()
@@ -1287,6 +1283,23 @@ class ChessUltimate:
                 tips = self._explain_move_thorough(player_move, board_before, drop, best)
                 msg_lines.extend(tips)
 
+                # --- הוספת "מהלכי תיאוריה" מה-JSON ---
+                current_sequence = " ".join(self.move_history).strip()
+                theory_suggestions = []
+
+                # חיפוש המשכים ב-JSON (מקסימום 3 הצעות)
+                count = 0
+                for moves_seq, name in self.openings.items():
+                    if moves_seq.startswith(current_sequence) and moves_seq != current_sequence:
+                        remainder = moves_seq[len(current_sequence):].strip()
+                        next_move = remainder.split()[0]
+                        theory_suggestions.append(f"{next_move} ({name})")
+                        count += 1
+                        if count >= 3: break
+
+                if theory_suggestions:
+                    msg_lines.append(f"\n📖 Theory: {', '.join(theory_suggestions)}")
+
                 # הצגת המהלך הטוב ביותר אם טעינו
                 if grade not in ("best", "good") and best is not None:
                     try:
@@ -1301,6 +1314,7 @@ class ChessUltimate:
                 # ניקוי טקסט לדיבור (TTS)
                 import unicodedata, re
                 def _clean_for_tts(line):
+                    line = line.replace("📖 Theory:", "Book moves are")
                     out = "".join(
                         [ch if (unicodedata.category(ch).startswith(('L', 'N')) or ch in " ,.") else " " for ch in
                          line])
@@ -1419,50 +1433,23 @@ class ChessUltimate:
     def undo_move(self):
         if self.review_mode:
             return
-
-        # Bump counter so any background thread (engine/coach) knows to abort
+        # 1. סימן ל-Thread שרץ ברקע להתעלם מהתוצאות (מה שכבר עשינו)
         self.move_counter += 1
 
-        # Release all locks and DRAIN the speech queue immediately so
-        # _wait_then_move stops looping and never calls execute_engine_move.
+        # 2. שחרור הנעילה של המנוע - זה החלק שמונע ממך לזוז!
         self.engine_busy = False
         self.waiting_for_coach = False
-        self._speech_busy = False
-        try:
-            while True:
-                self._speech_q.get_nowait()
-        except Exception:
-            pass
+        self._speech_busy = False  # שחרור נעילת דיבור ליתר ביטחון
 
-        # Figure out how many half-moves to pop:
-        # - If board.turn == BLACK it means White just moved and engine hasn't
-        #   responded yet (we interrupted it) -> pop only 1 (white's move).
-        # - If board.turn == WHITE the engine already played -> pop 2 (both moves).
-        if self.board.turn == chess.BLACK:
-            # Engine hasn't moved yet — undo only the player's move
-            moves_to_undo = 1
-        else:
-            # Engine already moved — undo both
-            moves_to_undo = 2
-
-        if len(self.board.move_stack) >= moves_to_undo:
-            for _ in range(moves_to_undo):
-                self.board.pop()
-            for _ in range(min(moves_to_undo, len(self.move_history))):
+        if len(self.board.move_stack) >= 2:
+            self.board.pop()
+            self.board.pop()
+            if len(self.move_history) >= 2:
                 self.move_history.pop()
-            for _ in range(min(moves_to_undo, len(self.review_boards))):
+                self.move_history.pop()
+            if len(self.review_boards) >= 2:
                 self.review_boards.pop()
-            # Undo captured pieces tracking (one entry per capture, so only
-            # pop if a capture actually happened — safe to pop up to moves_to_undo)
-            if moves_to_undo == 2:
-                if self.captured_b:
-                    self.captured_b.pop()
-                if self.captured_w:
-                    self.captured_w.pop()
-            else:
-                if self.captured_b:
-                    self.captured_b.pop()
-
+                self.review_boards.pop()
             self.last_move   = None
             self.selected_sq = None
             self.legal_targets = set()
@@ -1471,8 +1458,12 @@ class ChessUltimate:
             self.best_move_before = None
             self.refresh_history()
             self.redraw()
+            self.speak("Undo")
             self.status_var.set("Your turn – White")
             self._coach_msg("Move undone. Let's try again!", "info")
+            #self.coach_speak("Move undone. ")
+
+            # שורה קריטית: איפוס סופי של הנעילות כדי לוודא ששום דבר לא נשאר תקוע
             self.engine_busy = False
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -1510,7 +1501,6 @@ class ChessUltimate:
         self.black_time    = 600.0
         self.engine_busy   = False
         self.coach_highlight = None
-        self.theory_arrows    = []
         self.pre_move_eval   = 0.0
         self.best_move_before = None
         self.exit_review()
@@ -1599,141 +1589,6 @@ class ChessUltimate:
             self.speak_async(text)
 
     # ──────────────────────────────────────────────────────────────────────────
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Theory / Opening guide
-    # ──────────────────────────────────────────────────────────────────────────
-    def draw_theory_arrows(self):
-        """Draw coloured arrows for theory move suggestions."""
-        COLORS = ["#f39c12", "#27ae60", "#8e44ad"]   # up to 3 arrows, different colours
-        for i, (from_sq, to_sq, _) in enumerate(self.theory_arrows):
-            color = COLORS[i % len(COLORS)]
-            fx, fy = self.sq_xy(from_sq)
-            tx, ty = self.sq_xy(to_sq)
-            fcx, fcy = fx + self.SQ // 2, fy + self.SQ // 2
-            tcx, tcy = tx + self.SQ // 2, ty + self.SQ // 2
-            # Highlight squares
-            self.canvas.create_rectangle(fx, fy, fx + self.SQ, fy + self.SQ,
-                                         outline=color, width=3, fill="", dash=(6, 3))
-            self.canvas.create_rectangle(tx, ty, tx + self.SQ, ty + self.SQ,
-                                         outline=color, width=3, fill="", dash=(6, 3))
-            # Arrow
-            self.canvas.create_line(fcx, fcy, tcx, tcy,
-                                    fill=color, width=3, arrow=tk.LAST,
-                                    arrowshape=(14, 18, 6))
-
-    def show_theory(self):
-        """On-demand opening theory: show 2-3 move line with arrows and explanation."""
-        if self.board.turn != chess.WHITE:
-            self._coach_msg("Wait for your turn to check theory.", "info")
-            return
-
-        current_sequence = " ".join(
-            m.replace("x","").replace("+","").replace("#","")
-            for m in self.move_history
-        ).strip()
-
-        # Gather all continuations that start from the current position
-        continuations = {}   # next_move -> opening_name
-        for moves_seq, name in self.openings.items():
-            if moves_seq.startswith(current_sequence) and moves_seq != current_sequence:
-                remainder = moves_seq[len(current_sequence):].strip()
-                parts = remainder.split()
-                next_move = parts[0]
-                if next_move not in continuations:
-                    continuations[next_move] = (name, parts)   # name + full remainder parts
-
-        if not continuations:
-            self._coach_msg(
-                "You are out of the opening book!\n\nThis is uncharted territory — trust general principles:\n\u2022 Develop pieces toward the centre\n\u2022 Keep your King safe\n\u2022 Control central squares (e4,d4,e5,d5)",
-                "warn"
-            )
-            self.theory_arrows = []
-            self.redraw()
-            return
-
-        # Build arrows and explanation text
-        self.theory_arrows = []
-        lines = [f"📖 Opening Theory\n"]
-
-        # Current opening name
-        opening_now = detect_opening(self.board)
-        if opening_now:
-            lines.append(f"You are in: {opening_now}\n")
-
-        COLORS = ["#f39c12", "#27ae60", "#8e44ad"]
-        color_names = ["Orange", "Green", "Purple"]
-
-        for i, (san_move, (name, parts)) in enumerate(list(continuations.items())[:3]):
-            color = COLORS[i]
-            color_name = color_names[i]
-            # Try to parse the SAN move on the current board
-            try:
-                move = self.board.parse_san(san_move)
-                self.theory_arrows.append((move.from_square, move.to_square, color))
-            except Exception:
-                pass
-
-            # Build a 2-3 move line string
-            line_str = san_move
-            if len(parts) >= 2:
-                line_str += " " + parts[1]
-            if len(parts) >= 3:
-                line_str += " " + parts[2]
-
-            lines.append(f"{color_name} arrow → {san_move}")
-            lines.append(f"  Line: {line_str}")
-            lines.append(f"  Opening: {name}")
-            lines.append(self._explain_theory_move(san_move, name) + "\n")
-
-        self._coach_msg("\n".join(lines), "tip")
-
-        # Speak the first suggestion
-        if continuations:
-            first_san, (first_name, _) = list(continuations.items())[0]
-            self.speak_async(f"Theory suggests {first_san}, leading to the {first_name}.")
-
-        self.redraw()
-
-    def _explain_theory_move(self, san: str, opening_name: str) -> str:
-        """Return a short human explanation of why this theory move is played."""
-        san_clean = san.replace("x","").replace("+","").replace("#","")
-
-        # Central pawn moves
-        if san_clean in ("e4", "e5", "d4", "d5"):
-            return "  Why: Controls the centre — the most important opening principle."
-        if san_clean in ("c4", "c5"):
-            return "  Why: Fights for central space from the flank."
-        if san_clean in ("Nf3", "Nc3", "Nf6", "Nc6"):
-            return "  Why: Develops a knight toward the centre — active and flexible."
-        if san_clean in ("Bb5", "Bc4", "Bb4", "Bc5", "Bg5", "Bf4", "Be3"):
-            return "  Why: Develops a bishop to an active diagonal, eyeing key squares."
-        if san_clean in ("O-O", "O-O-O"):
-            return "  Why: Castles the King to safety and connects the rooks."
-        if san_clean in ("d6", "e6"):
-            return "  Why: Supports the centre and prepares piece development."
-        if san_clean in ("a6",):
-            return "  Why: Stops Bb5, prepares queenside expansion (Najdorf idea)."
-        if san_clean in ("g6",):
-            return "  Why: Prepares to fianchetto the bishop to g7, controlling the long diagonal."
-        if san_clean in ("cxd4", "exd4"):
-            return "  Why: Opens the centre, gains space, and opens lines for pieces."
-        if san_clean in ("Nxd4",):
-            return "  Why: Recaptures in the centre, keeping a strong pawn structure."
-        if san_clean in ("c3",):
-            return "  Why: Supports the centre pawn and prepares d4."
-        if san_clean in ("f4", "f5"):
-            return "  Why: Aggressive — grabs space and prepares kingside attack."
-        if "opening_name" and "Sicilian" in opening_name:
-            return "  Why: Part of the Sicilian — Black fights for the centre asymmetrically."
-        if "Ruy" in opening_name or "Lopez" in opening_name:
-            return "  Why: Part of the Ruy Lopez — White pressures the e5 pawn indirectly."
-        if "Italian" in opening_name:
-            return "  Why: Part of the Italian — both sides develop quickly toward the centre."
-        if "London" in opening_name:
-            return "  Why: Part of the London System — solid, reliable development."
-        return "  Why: A standard theory move improving piece activity."
-
     def __del__(self):
         if self.engine:
             try: self.engine.quit()

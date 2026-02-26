@@ -1,167 +1,141 @@
-# ♟ Chess Coach — Personal Notes
+♟ Chess Master Ultimate
+A Python desktop chess application with a built-in AI coach, opening theory guide, voice feedback, and game review — powered by Stockfish.
 
-A Python chess game with a built-in AI coach that speaks move announcements and coaching tips out loud, powered by Stockfish and pyttsx3.
+📋 Requirements
 
----
+Python 3.10+
+Windows (voice uses Windows SAPI5 via pywin32)
 
-## 📁 File Structure
+Install dependencies
+bashpip install python-chess pywin32
+Optional — for SVG piece images:
+bashpip install tksvg
 
-```
+⭐ How to Run
+1. Clone the repository
+bashgit clone https://github.com/RamiCarmy-eng/Chess_Game.git
+cd Chess_Game
+2. Install dependencies
+bashpip install python-chess pywin32
+3. Download Stockfish ⚠️
+
+Stockfish is not included in this repository (the binary is too large for GitHub).
+You must download it manually — the game will run without it but you will have no opponent to play against.
+
+Step-by-step:
+
+Go to https://stockfishchess.org/download/
+Under Windows, click Download Stockfish 17 for Windows
+Choose the AVX2 version (works on most modern PCs made after 2013)
+Extract the downloaded .zip file
+Inside the extracted folder you will find a file named stockfish-windows-x86-64-avx2.exe
+Create a folder called stockfish inside your Chess_Game folder
+Move the .exe file into that folder
+
+Your folder should look like this:
+Chess_Game/
+└── stockfish/
+    └── stockfish-windows-x86-64-avx2.exe   ← must be exactly this name and location
+
+Not sure if your PC supports AVX2?
+If the game crashes on startup, download the non-AVX2 version instead and update line 18 in test.py:
+pythonENGINE_PATH = Path("stockfish/stockfish-windows-x86-64.exe")
+
+4. Run the game
+bashpython test.py
+
+📁 File Structure
 Chess_Game/
 │
-├── claude_test.py          # Main program — run this
-├── clean_openings.py       # Cleans opening.json → clean_openings.json
-├── gen_openings.py         # Generates opening.json from PGN files
+├── test.py                          # Main application
+├── chess_stats.json                 # Auto-created — saves your W/L/D record
+├── Clean_openings.json              # Optional — opening book (ECO database)
 │
-├── opening.json            # Raw openings from KingBase PGN (~259k entries, ECO codes)
-├── clean_openings.json     # Cleaned openings ready for the program (~820k entries)
+├── pieces/                          # Optional — SVG piece images
+│   ├── wk.svg  wq.svg  wr.svg  wb.svg  wn.svg  wp.svg
+│   └── bk.svg  bq.svg  br.svg  bb.svg  bn.svg  bp.svg
 │
-├── chess_stats.json        # Win/loss/draw stats (auto-created on first run)
-│
-├── stockfish/
-│   └── stockfish-windows-x86-64-avx2.exe
-│
-├── pieces/                 # SVG piece images (optional — falls back to text)
-│
-└── openings/               # KingBase PGN files used by gen_openings.py
-    ├── KingBaseLite2019-01.pgn
-    ├── KingBaseLite2019-B20-B49.pgn
-    └── ... (17 files total)
-```
+└── stockfish/                       # NOT included — download manually (see above)
+    └── stockfish-windows-x86-64-avx2.exe
+Opening book (Clean_openings.json)
+A JSON file mapping move sequences to opening names:
+json{
+  "e4 e5 Nf3 Nc6 Bb5": "Ruy López",
+  "e4 c5": "Sicilian Defence"
+}
+If the file is missing, a built-in fallback list of ~100 openings is used automatically.
+Piece images
+Place SVG files named wk.svg, bq.svg, etc. in the pieces/ folder. If missing, the board falls back to Unicode chess symbols.
 
----
+🎮 How to Play
+You play as White. Click a piece to select it — legal moves appear as dots on the board. Click a destination to move. The engine (Black) responds automatically.
+Pawn promotion is automatic to Queen.
 
-## ⚙️ Installation
+🖥 Interface Overview
+AreaDescriptionTop barYour name, W/L/D record, difficulty level, current opening nameClocks10-minute countdown for both sidesEval barVertical bar on the left — white section grows when you're winningBoard8×8 board with rank/file labelsCaptured piecesStrips above and below the board showing lost materialMove historyScrollable panel on the right listing all moves by numberCoach panelBelow move history — feedback and tips after each moveStatus barCurrent game state at the bottom
 
-### Requirements
-```
-pip install python-chess pyttsx3
-```
+🔘 Buttons
+ButtonAction↩ UndoTake back your last move. If pressed while the coach is still speaking (engine hasn't replied yet), only your move is undone. If the engine has already played, both moves are undone.Easy / Medium / ProSet engine strength (Stockfish Skill Level 0 / 10 / 20)⟳ New GameReset the board and start fresh📖 TheoryShow opening theory for the current position (see below)▶ Review GameEnter game review mode to step through your moves
 
-- **Python 3.10+**
-- **Stockfish** — download from https://stockfishchess.org and place the `.exe` in `stockfish/`
-- **tksvg** (optional) — for SVG piece images: `pip install tksvg`
+🎓 Coach
+The coach analyses your move and gives feedback in the coach panel, spoken aloud via Windows TTS.
+Move grades:
 
-### First Run
-```bash
-python claude_test.py
-```
+✅ Best move
+👍 Good move
+💡 Inaccuracy
+⚠️ Mistake
+❌ Blunder
 
-On first run it will ask for your name, then start the game.
+What the coach checks:
 
----
+Hung or undefended pieces
+Missed captures, checks, or checkmates
+Pawn structure issues (doubled pawns)
+King safety and castling rights
+Early queen development
+Piece development and central control
+Piece activity and outposts
+Endgame king activation
 
-## 🚀 How to Run
+The coach can be toggled ON/OFF using the button in the coach panel header.
 
-```bash
-cd C:\Users\carmi\pythonprograms\Chess_Game
-python claude_test.py
-```
+📖 Opening Theory (on demand)
+Press 📖 Theory during your turn to get opening guidance. The coach will:
 
-If `clean_openings.json` is present in the same folder, it loads automatically.
-The terminal shows: `Loaded 820500 openings from clean_openings.json`
+Tell you which opening you are currently in
+Show up to 3 coloured arrows on the board — each a different theory continuation
+Display in the coach panel for each arrow:
 
----
+A 2–3 move line (your move → Black's response → your follow-up)
+The opening name that line leads to
+A plain-English explanation of why that move is played
 
-## 🎓 Coach Features
 
-The coach panel appears on the right side of the board. Toggle it with the **Coach ON/OFF** button.
+Speak the first suggestion aloud
 
-### What the coach says after every move:
+Arrow colours: 🟠 Orange = first choice, 🟢 Green = second, 🟣 Purple = third
+Arrows disappear automatically when you make your next move.
+If you are outside the opening book, the coach explains the general principles to rely on instead.
 
-| Grade | When | Example |
-|-------|------|---------|
-| ✅ Best move | You played exactly what Stockfish suggested | "Best move! Well done!" |
-| 👍 Good move | Small or no loss in position | "Good move!" |
-| 💡 Inaccuracy | 50–200 centipawn loss | "Slightly better options exist" |
-| ⚠️ Mistake | 200–600 centipawn loss | "You gave up advantage" |
-| ❌ Blunder | 600+ centipawn loss | "Blunder! Lost ~2 pawns of advantage" |
+🔍 Game Review
+Press ▶ Review Game after a game (or mid-game) to step through every move.
+ButtonAction◀◀ StartJump to starting position◀ PrevStep back one move▶ NextStep forward one move▶▶ EndJump to final position✕ Exit ReviewReturn to the live game
 
-### Coaching tips (spoken in priority order):
+🏆 Stats
+Wins, losses, and draws are saved to chess_stats.json and shown in the top bar. Stats persist across sessions.
 
-1. 👑 **Missed checkmate** — highest priority, always spoken first
-2. ⚠ **Hung a piece** — you moved a piece to an undefended square
-3. ⚠ **Left a piece hanging** — your move exposed another piece
-4. 💰 **Missed free capture** — you could have taken a piece for free
-5. 🎯 **Missed check** — a better move would have given check
-6. 💡 **Better piece suggested** — "Instead of the Pawn, consider your Knight from g1 to f3 — it develops toward the centre"
-7. 🏰 **King safety** — moved King before castling
-8. 📌 **Doubled pawns** — pawn structure warning
-9. ⚠ **Early Queen** — risky in the opening
-10. 👌 **Good development** — positive feedback in opening
-11. 💥 **Good capture** — positive feedback for good trades
-12. 🏰 **Castling** — positive feedback
+⚠️ Known Limitations
 
-### Voice system
-
-- Move announcements: `"Yakov plays Knight f3"` / `"Computer plays Bishop c4"`
-- Coach tips: spoken after each move in priority order
-- All speech goes through a single queue — no overlapping or clashing
-- Rate: 170 words/minute (moves) / 155 words/minute (coach queue)
-
----
-
-## 🔧 Difficulty
-
-| Button | Skill Level | Description |
-|--------|-------------|-------------|
-| Easy | 0 | Makes deliberate mistakes |
-| Medium | 10 | Club player strength |
-| Pro | 20 | Full Stockfish strength |
-
-Difficulty is passed to the engine on every move so switching mid-game works immediately.
-
----
-
-## 📖 Opening Database
-
-### Regenerating openings from PGN files:
-```bash
-python gen_openings.py
-# → saves opening.json (~259k raw entries with ECO codes)
-```
-
-### Cleaning the database:
-```bash
-python clean_openings.py
-# → reads opening.json
-# → maps ECO codes (e.g. "ECO B92") to real names ("Sicilian – Najdorf")
-# → deduplicates, adds family prefixes
-# → saves clean_openings.json (~820k entries)
-```
-
-### Important: notation format
-`gen_openings.py` strips `x`, `+`, `#` from moves:
-- `cxd4` → `cd4`
-- `Nxd4` → `Nd4`
-
-`detect_opening()` in `claude_test.py` strips the same characters before lookup so both sides match.
-
----
-
-## 🐛 Known Issues / Notes
-
-- **Voice only works on Windows** — pyttsx3 uses SAPI5
-- **Only one pyttsx3 instance allowed** — all speech goes through `_speech_q` queue. Don't add `pyttsx3.init()` anywhere else
-- **Coach speak** uses `self._speech_q.put(text)` — NOT `speak_async()` which uses `self.voice` and clashes
-- **`drop` is in centipawns** — 100 = 1 pawn. Thresholds: blunder ≥600, mistake ≥200, inaccuracy ≥50
-- Engine runs in background thread — never call `engine.analyse()` from two threads at once
-
----
-
-## 📝 Key Functions
-
-| Function | What it does |
-|----------|-------------|
-| `_engine_and_coach()` | Background thread: analyses move, gets engine reply, builds coach message |
-| `_explain_move_thorough()` | Generates all coaching tips sorted by priority |
-| `_why_better()` | Explains WHY a suggested move is better (fork, centre, development...) |
-| `detect_opening()` | Looks up current position in `clean_openings.json` |
-| `coach_speak()` | Strips emoji, puts text in `_speech_q` |
-| `_start_speech_worker()` | Single background thread with its own pyttsx3 engine |
-| `execute_player_move()` | Handles player move, triggers coach thread |
-| `execute_engine_move()` | Handles computer move, announces it |
-
----
-
-*Last updated: February 2026*
+Windows only (TTS uses Windows SAPI via win32com; sound uses winsound)
+You always play as White
+Pawn promotion always promotes to Queen
+Requires the AVX2 Stockfish build — update ENGINE_PATH in test.py if using a different build
+Share
+          var _sift = (window._sift = window._sift || []);
+          _sift.push(["_setAccount", "99dfa2e716"]);
+          _sift.push(["_setTrackerUrl", "s-cdn.anthropic.com"]);
+          _sift.push(["_setUserId", "88d8e7a9-aa1e-4f2b-8666-b34c3a949edb"]);
+          _sift.push(["_setSessionId", "5b3d7a4e-9a33-47f7-9502-44f5c1ab0843"]);
+          _sift.push(["_trackPageview"]);
+      

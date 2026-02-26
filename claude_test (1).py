@@ -1,3 +1,4 @@
+import pyttsx3
 import tkinter as tk
 from tkinter import messagebox, simpledialog, font as tkfont
 import chess
@@ -15,7 +16,7 @@ except ImportError:
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 PIECES_FOLDER = Path("pieces")
-ENGINE_PATH   = Path("stockfish/stockfish-windows-x86-64-avx2.exe")
+ENGINE_PATH   = Path("engine/stockfish-windows-x86-64-avx2.exe")
 STATS_FILE    = "chess_stats.json"
 
 # ── Opening book (ECO prefix table) ───────────────────────────────────────────
@@ -158,7 +159,6 @@ def _load_openings() -> dict:
 
 OPENINGS = _load_openings()
 
-Theory_Moves = []
 
 def detect_opening(board: chess.Board) -> str:
     """Return the best matching opening name for the current move stack."""
@@ -211,49 +211,32 @@ class ChessUltimate:
         self.review_boards= []         # board FEN snapshots after each move
         self.engine_busy  = False
         self.tts_busy = False
-        self.openings = OPENINGS
-        self.move_counter = 0
-
 
         # ── Coach ─────────────────────────────────────────────────────────────
         self.coach_on         = True          # can be toggled
         self.pre_move_eval    = 0.0           # eval BEFORE player moves (cp, white pov)
         self.best_move_before = None          # engine's best move before player moves
         self.coach_highlight  = None          # (from_sq, to_sq) to draw in green
-        self.theory_arrows    = []            # list of (from_sq, to_sq, color) for theory display
 
         # ── Clocks ────────────────────────────────────────────────────────────
         self.white_time = 600.0
         self.black_time = 600.0
         self.last_tick  = time.time()
 
-        # ── Speech via Windows SAPI (win32com) — reliable background thread ──
-        import queue as _q
-        self._speech_q    = _q.Queue()
-        self._speech_busy = False
-
-        def _worker():
-            import win32com.client
-            sapi = win32com.client.Dispatch("SAPI.SpVoice")
-            sapi.Rate = 1
-            while True:
-                text = self._speech_q.get()
-                if text is None:
-                    break
-                self._speech_busy = True
-                try:
-                    sapi.Speak(text)
-                except Exception as e:
-                    print(f"[SAPI] error: {e}")
-                finally:
-                    self._speech_busy = False
-
-        threading.Thread(target=_worker, daemon=True).start()
+        # Voice engine
+        self.voice = pyttsx3.init()
+        self.voice.setProperty('rate', 170)
 
         def speak_async(text):
-            self._speech_q.put(str(text))
+            threading.Thread(
+                target=lambda: self._speak(text),
+                daemon=True
+            ).start()
 
         self.speak_async = speak_async
+
+        # ── Speech ────────────────────────────────────────────────────────────
+        self._start_speech_worker()
 
         # ── Build UI ──────────────────────────────────────────────────────────
         self.init_engine()
@@ -271,6 +254,13 @@ class ChessUltimate:
             with open(STATS_FILE) as f:
                 return json.load(f)
         return {"wins": 0, "losses": 0, "draws": 0}
+
+    def _speak(self, text):
+        try:
+            self.voice.say(text)
+            self.voice.runAndWait()
+        except:
+            pass
 
     def save_stats(self):
         with open(STATS_FILE, "w") as f:
@@ -473,7 +463,6 @@ class ChessUltimate:
         btn(btm, "Pro",             lambda: self.set_difficulty(20)).pack(side=tk.LEFT, padx=4)
         btn(btm, "⟳  New Game",    self.new_game,    "#27ae60").pack(side=tk.LEFT, padx=6)
         btn(btm, "▶  Review Game", self.start_review,"#8e44ad").pack(side=tk.LEFT, padx=6)
-        btn(btm, "📖 Theory",      self.show_theory,  "#2980b9").pack(side=tk.LEFT, padx=6)
 
         # Review nav (hidden until review mode)
         self.review_frame = tk.Frame(self.root, bg=BG)
@@ -527,41 +516,11 @@ class ChessUltimate:
     # ──────────────────────────────────────────────────────────────────────────
     # Drawing
     # ──────────────────────────────────────────────────────────────────────────
-
-    def get_book_suggestions(self):
-        current_moves = " ".join(m.replace("x","").replace("+","").replace("#","") for m in self.move_history)
-        suggestions = []
-        # חיפוש כל הפתיחות שמתחילות במהלכים ששיחקת עד עכשיו
-        for moves_sequence, name in self.openings.items():
-            if moves_sequence.startswith(current_moves) and moves_sequence != current_moves:
-                # חילוץ המהלך הבא בלבד
-                remainder = moves_sequence[len(current_moves):].strip()
-                next_move = remainder.split()[0]
-                suggestions.append(f"{next_move} ({name})")
-        return suggestions[:3]  # החזרת 3 האפשרויות הראשונות
-
-    def get_theory_moves(self):
-        # הופך את היסטוריית המהלכים למחרוזת (למשל "e4 e5")
-        current_sequence = " ".join(m.replace("x","").replace("+","").replace("#","") for m in self.move_history).strip()
-        theory_suggestions = {}
-
-        for moves, name in self.openings.items():
-            # אם הפתיחה ב-JSON מתחילה בדיוק במהלכים ששיחקנו
-            if moves.startswith(current_sequence) and moves != current_sequence:
-                # מחלצים את המהלך הבא בלבד
-                after_current = moves[len(current_sequence):].strip()
-                next_move = after_current.split()[0]
-                if next_move not in theory_suggestions:
-                    theory_suggestions[next_move] = name
-
-        return theory_suggestions  # מחזיר מילון של {מהלך: שם הפתיחה}
-
     def redraw(self):
         self.canvas.delete("all")
         self.draw_squares()
         self.draw_legal_dots()
         self.draw_coach_highlight()
-        self.draw_theory_arrows()
         self.draw_pieces()
         self.draw_eval_bar()
         self.update_captured_display()
@@ -1214,12 +1173,12 @@ class ChessUltimate:
             self.speak_async("Check!")
         self.last_move = move
         self.coach_highlight = None        # clear previous suggestion
-        self.theory_arrows = []             # clear theory arrows on new move
         self.move_history.append(san)
         self.review_boards.append(self.board.fen())
         self.refresh_history()
         self.opening_label.config(text=detect_opening(self.board))
         self.redraw()
+        self.speak(san)
 
         self.status_var.set("Engine thinking…")
 
@@ -1234,136 +1193,150 @@ class ChessUltimate:
 
     def _engine_and_coach(self, player_move: chess.Move, board_before: chess.Board):
         """
-        Background thread with Opening Theory integration and Undo protection.
+        Single background thread that does ALL engine work sequentially:
+        1. Evaluate the position after player's move (for coach feedback)
+        2. Get engine's reply move
+        3. Evaluate after engine's reply (for eval bar)
         """
         if not self.engine:
             return
 
-        # 1. שמירת המצב הנוכחי להגנה מפני Undo
-        start_move_count = self.move_counter
-
-        coach_msg = None
-        coach_tag = "good"
-        coach_hi = None
+        coach_msg  = None
+        coach_tag  = "good"
+        coach_hi   = None
         spoken_tip = None
 
-        # ── Step 1: Coach feedback & Opening Theory ──────────────────────────
+        # ── Step 1: Coach feedback (pure pattern analysis, no engine call) ──────
         if self.coach_on:
             try:
                 best = self.best_move_before
+                drop = self.pre_move_eval   # if no post_eval, use pre as proxy
 
-                # חישוב ה-Drop (הפרש איכות המהלך)
+                # Try to get post-move eval from engine (optional — don't crash if fails)
                 try:
                     info_after = self.engine.analyse(self.board, chess.engine.Limit(depth=10, time=0.3))
                     score_after = info_after["score"].white()
                     post_eval = float(score_after.score(mate_score=3000) or 0)
                     drop = self.pre_move_eval - post_eval
-                except:
+                except Exception as e:
                     drop = 0.0
 
-                # קביעת ציון למהלך
                 player_played_best = (best is not None and player_move == best)
+
                 if player_played_best:
-                    grade = "best"
+                    grade = "best";       coach_tag = "good"
                 elif drop >= 250:
-                    grade = "blunder"
+                    grade = "blunder";    coach_tag = "blunder"
                 elif drop >= 100:
-                    grade = "mistake"
+                    grade = "mistake";    coach_tag = "warn"
                 elif drop >= 40:
-                    grade = "inaccuracy"
+                    grade = "inaccuracy"; coach_tag = "warn"
+                elif drop >= 10:
+                    grade = "slight";     coach_tag = "tip"
                 else:
-                    grade = "good"
+                    grade = "good";       coach_tag = "good"
+
 
                 headers = {
-                    "best": "✅ Best move! Well done!",
-                    "good": "👍 Good move!",
-                    "inaccuracy": "💡 Inaccuracy – better options existed.",
-                    "mistake": "⚠️ Mistake – you lost advantage.",
-                    "blunder": "❌ Blunder! Significant loss.",
+                    "best":       "✅ Best move! Well done!",
+                    "good":       "👍 Good move!",
+                    "slight":     "💡 Slightly better options exist.",
+                    "inaccuracy": "💡 Inaccuracy – a better option was available.",
+                    "mistake":    "⚠️ Mistake – you gave up advantage.",
+                    "blunder":    f"❌ Blunder! Lost ~{abs(drop)//100} pawn(s) of advantage.",
                 }
-                msg_lines = [headers.get(grade, "👍 Move played.")]
+                msg_lines = [headers[grade]]
 
-                # הוספת הסברים (Tips)
                 tips = self._explain_move_thorough(player_move, board_before, drop, best)
                 msg_lines.extend(tips)
 
-                # הצגת המהלך הטוב ביותר אם טעינו
-                if grade not in ("best", "good") and best is not None:
+                show_best = grade not in ("best", "good")
+                if show_best and best is not None:
                     try:
                         best_san = board_before.san(best)
-                        msg_lines.append(f"🔵 Better: {best_san}")
+                        msg_lines.append(f"\n🔵 Better: {best_san}")
                         coach_hi = (best.from_square, best.to_square)
-                    except:
+                    except Exception:
                         pass
 
                 coach_msg = "\n".join(msg_lines)
 
-                # ניקוי טקסט לדיבור (TTS)
+                # Build spoken parts
                 import unicodedata, re
+                _piece_map = {'N':'Knight','B':'Bishop','R':'Rook','Q':'Queen','K':'King'}
+
+                def _translate_better(text):
+                    def _piece(m):
+                        return 'Better: ' + _piece_map.get(m.group(1), m.group(1)) + ' ' + m.group(2)
+                    return re.sub(r'Better: ([NBRQK])([a-h1-8x])', _piece, text)
+
                 def _clean_for_tts(line):
-                    out = "".join(
-                        [ch if (unicodedata.category(ch).startswith(('L', 'N')) or ch in " ,.") else " " for ch in
-                         line])
-                    return " ".join(out.split()).strip()
+                    out = []
+                    for ch in line:
+                        cat = unicodedata.category(ch)
+                        if cat == 'Pd':
+                            out.append(',')
+                        elif cat.startswith('L') or cat.startswith('N') or cat == 'Zs' or ch in ' ,.!?:':
+                            out.append(ch)
+                        else:
+                            out.append(' ')
+                    return ' '.join(''.join(out).split()).strip().strip(',').strip()
 
-                spoken_parts = [_clean_for_tts(ln) for ln in msg_lines if ln.strip()]
-                spoken_tip = " . ".join(spoken_parts)
+                spoken_parts = []
+                for line in msg_lines:
+                    clean = _clean_for_tts(line)
+                    clean = _translate_better(clean)
+                    if clean:
+                        spoken_parts.append(clean)
+                spoken_tip = '. '.join(spoken_parts) if spoken_parts else None
 
-            except Exception as e:
-                print(f"Coach analysis error: {e}")
+            except Exception:
+                pass
 
-        # ── Step 2: Engine plays ──────────────────────────────────────────────
+        # ── Step 2: Engine plays its move ─────────────────────────────────────
         try:
             result = self.engine.play(self.board, chess.engine.Limit(time=0.6),
                                       options={"Skill Level": self.skill_level})
-        except:
+        except Exception:
             self.root.after(0, lambda: setattr(self, 'engine_busy', False))
             return
 
-        # ── Step 3 & 4: Eval & Pre-analysis for next turn ─────────────────────
-        new_pre_eval = 0.0
+        # ── Step 3: Eval after engine move (for eval bar) ─────────────────────
+        try:
+            info2 = self.engine.analyse(self.board, chess.engine.Limit(depth=10))
+            s2 = info2["score"].white()
+            self.eval_score = float(s2.score(mate_score=3000) or 0)
+        except Exception:
+            pass
+
+        # ── Step 4: Pre-analyse for NEXT player move ──────────────────────────
+        new_pre_eval  = 0.0
         new_best_move = None
         try:
+            # Peek at board after engine move to get baseline for next turn
             test_board = self.board.copy()
             test_board.push(result.move)
             info3 = self.engine.analyse(test_board, chess.engine.Limit(depth=12))
             s3 = info3["score"].white()
-            new_pre_eval = float(s3.score(mate_score=3000) or 0)
+            new_pre_eval  = float(s3.score(mate_score=3000) or 0)
             new_best_move = info3.get("pv", [None])[0]
-            self.eval_score = new_pre_eval
-        except:
+        except Exception:
             pass
 
-        # ── Deliver ───────────────────────────────────────────────────────────
+        # ── Deliver everything back to UI thread ──────────────────────────────
         def _deliver():
-            # הגנה מפני Undo
-            if self.move_counter != start_move_count:
-                print("Undo detected - cleaning up engine state.")
-                self.engine_busy = False  # שחרור נעילה גם כאן ליתר ביטחון
-                return
-
             if coach_msg and self.coach_on:
                 self._coach_msg(coach_msg, coach_tag)
                 self.coach_highlight = coach_hi
-                self.redraw()
-
             if spoken_tip and self.coach_on:
-                self.coach_speak("Coach says: " + spoken_tip)
-
-            def _wait_then_move():
-                # הגנה נוספת בתוך ה-wait למקרה של Undo ברגע האחרון
-                if self.move_counter != start_move_count:
-                    self.engine_busy = False  # שחרור נעילה
-                    return
-
-                if self._speech_busy or not self._speech_q.empty():
-                    self.root.after(300, _wait_then_move)
-                else:
-                    self.execute_engine_move(result.move)
-                    self.pre_move_eval = new_pre_eval
-                    self.best_move_before = new_best_move
-
-            self.root.after(500, _wait_then_move)
+                parts = [p.strip() for p in spoken_tip.split('.') if p.strip()]
+                if parts:
+                    self.coach_speak("Coach says: " + parts[0])
+                    for part in parts[1:]:
+                        self.coach_speak(part)
+            self.execute_engine_move(result.move)
+            self.pre_move_eval    = new_pre_eval
+            self.best_move_before = new_best_move
 
         self.root.after(0, _deliver)
 
@@ -1419,50 +1392,12 @@ class ChessUltimate:
     def undo_move(self):
         if self.review_mode:
             return
-
-        # Bump counter so any background thread (engine/coach) knows to abort
-        self.move_counter += 1
-
-        # Release all locks and DRAIN the speech queue immediately so
-        # _wait_then_move stops looping and never calls execute_engine_move.
-        self.engine_busy = False
-        self.waiting_for_coach = False
-        self._speech_busy = False
-        try:
-            while True:
-                self._speech_q.get_nowait()
-        except Exception:
-            pass
-
-        # Figure out how many half-moves to pop:
-        # - If board.turn == BLACK it means White just moved and engine hasn't
-        #   responded yet (we interrupted it) -> pop only 1 (white's move).
-        # - If board.turn == WHITE the engine already played -> pop 2 (both moves).
-        if self.board.turn == chess.BLACK:
-            # Engine hasn't moved yet — undo only the player's move
-            moves_to_undo = 1
-        else:
-            # Engine already moved — undo both
-            moves_to_undo = 2
-
-        if len(self.board.move_stack) >= moves_to_undo:
-            for _ in range(moves_to_undo):
-                self.board.pop()
-            for _ in range(min(moves_to_undo, len(self.move_history))):
-                self.move_history.pop()
-            for _ in range(min(moves_to_undo, len(self.review_boards))):
-                self.review_boards.pop()
-            # Undo captured pieces tracking (one entry per capture, so only
-            # pop if a capture actually happened — safe to pop up to moves_to_undo)
-            if moves_to_undo == 2:
-                if self.captured_b:
-                    self.captured_b.pop()
-                if self.captured_w:
-                    self.captured_w.pop()
-            else:
-                if self.captured_b:
-                    self.captured_b.pop()
-
+        if len(self.board.move_stack) >= 2:
+            self.board.pop(); self.board.pop()
+            if len(self.move_history) >= 2:
+                self.move_history.pop(); self.move_history.pop()
+            if len(self.review_boards) >= 2:
+                self.review_boards.pop(); self.review_boards.pop()
             self.last_move   = None
             self.selected_sq = None
             self.legal_targets = set()
@@ -1471,9 +1406,10 @@ class ChessUltimate:
             self.best_move_before = None
             self.refresh_history()
             self.redraw()
+            self.speak("Undo")
             self.status_var.set("Your turn – White")
             self._coach_msg("Move undone. Let's try again!", "info")
-            self.engine_busy = False
+            self.coach_speak("Move undone. Let's try again!")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Game over
@@ -1510,7 +1446,6 @@ class ChessUltimate:
         self.black_time    = 600.0
         self.engine_busy   = False
         self.coach_highlight = None
-        self.theory_arrows    = []
         self.pre_move_eval   = 0.0
         self.best_move_before = None
         self.exit_review()
@@ -1581,17 +1516,41 @@ class ChessUltimate:
         self.redraw()
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Speech – dedicated thread with its OWN pyttsx3 engine instance.
+    # pyttsx3 must not be shared across threads; creating one per thread works.
+    # ──────────────────────────────────────────────────────────────────────────
+    def _start_speech_worker(self):
+        import queue as _q
+        self._speech_q = _q.Queue()
+
+        def _worker():
+            import pyttsx3 as _tts
+            engine = _tts.init()
+            engine.setProperty('rate', 155)
+            while True:
+                text = self._speech_q.get()
+                if text is None:
+                    break
+                try:
+                    engine.say(text)
+                    engine.runAndWait()
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def speak(self, text: str):
-        """Announce a chess SAN move — translates piece letters to words."""
+        """Queue a chess SAN move – translates piece letters to full words."""
         readable = (text
                     .replace('N', 'Knight').replace('B', 'Bishop')
                     .replace('R', 'Rook') .replace('Q', 'Queen')
                     .replace('K', 'King') .replace('x', 'takes')
                     .replace('+', 'check').replace('#', 'checkmate'))
-        self.speak_async(readable)
+        self._speech_q.put(readable)
 
     def coach_speak(self, text: str):
-        """Speak coach text — strips emoji then queues."""
+        """Speak coach text through the same voice system — no new pyttsx3 instance."""
         for ch in ['✅','👌','💡','⚠️','❌','🔵','👍','💰','🎯','👑','🏰','📌','💥','⚠','–','—']:
             text = text.replace(ch, '')
         text = text.strip()
@@ -1599,141 +1558,6 @@ class ChessUltimate:
             self.speak_async(text)
 
     # ──────────────────────────────────────────────────────────────────────────
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Theory / Opening guide
-    # ──────────────────────────────────────────────────────────────────────────
-    def draw_theory_arrows(self):
-        """Draw coloured arrows for theory move suggestions."""
-        COLORS = ["#f39c12", "#27ae60", "#8e44ad"]   # up to 3 arrows, different colours
-        for i, (from_sq, to_sq, _) in enumerate(self.theory_arrows):
-            color = COLORS[i % len(COLORS)]
-            fx, fy = self.sq_xy(from_sq)
-            tx, ty = self.sq_xy(to_sq)
-            fcx, fcy = fx + self.SQ // 2, fy + self.SQ // 2
-            tcx, tcy = tx + self.SQ // 2, ty + self.SQ // 2
-            # Highlight squares
-            self.canvas.create_rectangle(fx, fy, fx + self.SQ, fy + self.SQ,
-                                         outline=color, width=3, fill="", dash=(6, 3))
-            self.canvas.create_rectangle(tx, ty, tx + self.SQ, ty + self.SQ,
-                                         outline=color, width=3, fill="", dash=(6, 3))
-            # Arrow
-            self.canvas.create_line(fcx, fcy, tcx, tcy,
-                                    fill=color, width=3, arrow=tk.LAST,
-                                    arrowshape=(14, 18, 6))
-
-    def show_theory(self):
-        """On-demand opening theory: show 2-3 move line with arrows and explanation."""
-        if self.board.turn != chess.WHITE:
-            self._coach_msg("Wait for your turn to check theory.", "info")
-            return
-
-        current_sequence = " ".join(
-            m.replace("x","").replace("+","").replace("#","")
-            for m in self.move_history
-        ).strip()
-
-        # Gather all continuations that start from the current position
-        continuations = {}   # next_move -> opening_name
-        for moves_seq, name in self.openings.items():
-            if moves_seq.startswith(current_sequence) and moves_seq != current_sequence:
-                remainder = moves_seq[len(current_sequence):].strip()
-                parts = remainder.split()
-                next_move = parts[0]
-                if next_move not in continuations:
-                    continuations[next_move] = (name, parts)   # name + full remainder parts
-
-        if not continuations:
-            self._coach_msg(
-                "You are out of the opening book!\n\nThis is uncharted territory — trust general principles:\n\u2022 Develop pieces toward the centre\n\u2022 Keep your King safe\n\u2022 Control central squares (e4,d4,e5,d5)",
-                "warn"
-            )
-            self.theory_arrows = []
-            self.redraw()
-            return
-
-        # Build arrows and explanation text
-        self.theory_arrows = []
-        lines = [f"📖 Opening Theory\n"]
-
-        # Current opening name
-        opening_now = detect_opening(self.board)
-        if opening_now:
-            lines.append(f"You are in: {opening_now}\n")
-
-        COLORS = ["#f39c12", "#27ae60", "#8e44ad"]
-        color_names = ["Orange", "Green", "Purple"]
-
-        for i, (san_move, (name, parts)) in enumerate(list(continuations.items())[:3]):
-            color = COLORS[i]
-            color_name = color_names[i]
-            # Try to parse the SAN move on the current board
-            try:
-                move = self.board.parse_san(san_move)
-                self.theory_arrows.append((move.from_square, move.to_square, color))
-            except Exception:
-                pass
-
-            # Build a 2-3 move line string
-            line_str = san_move
-            if len(parts) >= 2:
-                line_str += " " + parts[1]
-            if len(parts) >= 3:
-                line_str += " " + parts[2]
-
-            lines.append(f"{color_name} arrow → {san_move}")
-            lines.append(f"  Line: {line_str}")
-            lines.append(f"  Opening: {name}")
-            lines.append(self._explain_theory_move(san_move, name) + "\n")
-
-        self._coach_msg("\n".join(lines), "tip")
-
-        # Speak the first suggestion
-        if continuations:
-            first_san, (first_name, _) = list(continuations.items())[0]
-            self.speak_async(f"Theory suggests {first_san}, leading to the {first_name}.")
-
-        self.redraw()
-
-    def _explain_theory_move(self, san: str, opening_name: str) -> str:
-        """Return a short human explanation of why this theory move is played."""
-        san_clean = san.replace("x","").replace("+","").replace("#","")
-
-        # Central pawn moves
-        if san_clean in ("e4", "e5", "d4", "d5"):
-            return "  Why: Controls the centre — the most important opening principle."
-        if san_clean in ("c4", "c5"):
-            return "  Why: Fights for central space from the flank."
-        if san_clean in ("Nf3", "Nc3", "Nf6", "Nc6"):
-            return "  Why: Develops a knight toward the centre — active and flexible."
-        if san_clean in ("Bb5", "Bc4", "Bb4", "Bc5", "Bg5", "Bf4", "Be3"):
-            return "  Why: Develops a bishop to an active diagonal, eyeing key squares."
-        if san_clean in ("O-O", "O-O-O"):
-            return "  Why: Castles the King to safety and connects the rooks."
-        if san_clean in ("d6", "e6"):
-            return "  Why: Supports the centre and prepares piece development."
-        if san_clean in ("a6",):
-            return "  Why: Stops Bb5, prepares queenside expansion (Najdorf idea)."
-        if san_clean in ("g6",):
-            return "  Why: Prepares to fianchetto the bishop to g7, controlling the long diagonal."
-        if san_clean in ("cxd4", "exd4"):
-            return "  Why: Opens the centre, gains space, and opens lines for pieces."
-        if san_clean in ("Nxd4",):
-            return "  Why: Recaptures in the centre, keeping a strong pawn structure."
-        if san_clean in ("c3",):
-            return "  Why: Supports the centre pawn and prepares d4."
-        if san_clean in ("f4", "f5"):
-            return "  Why: Aggressive — grabs space and prepares kingside attack."
-        if "opening_name" and "Sicilian" in opening_name:
-            return "  Why: Part of the Sicilian — Black fights for the centre asymmetrically."
-        if "Ruy" in opening_name or "Lopez" in opening_name:
-            return "  Why: Part of the Ruy Lopez — White pressures the e5 pawn indirectly."
-        if "Italian" in opening_name:
-            return "  Why: Part of the Italian — both sides develop quickly toward the centre."
-        if "London" in opening_name:
-            return "  Why: Part of the London System — solid, reliable development."
-        return "  Why: A standard theory move improving piece activity."
-
     def __del__(self):
         if self.engine:
             try: self.engine.quit()
@@ -1745,10 +1569,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     app  = ChessUltimate(root)
     root.mainloop()
-
-
-
-
 
 
 
