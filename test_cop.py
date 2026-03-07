@@ -292,21 +292,9 @@ _COMPILED_TEMPLATES = [
 ]
 
 
-def _sq_he(sq: str) -> str:
-    """Translate a chess square name (e4, f3...) to Hebrew pronunciation."""
-    FILES = {'a':'איי','b':'בי','c':'סי','d':'די','e':'אי','f':'אף','g':"ג'י",'h':"אייץ'"}
-    RANKS = {'1':'אחת','2':'שתיים','3':'שלוש','4':'ארבע','5':'חמש','6':'שש','7':'שבע','8':'שמונה'}
-    if len(sq) == 2 and sq[0] in FILES and sq[1] in RANKS:
-        return f"{FILES[sq[0]]} {RANKS[sq[1]]}"
-    return sq
-
-
 def translate_to_hebrew(text: str) -> str:
     """Translate English speech text to Hebrew — used only for TTS, not display."""
-    import re as _re2
     result = text
-    # Translate square names first (e4->אי ארבע etc.) before other substitutions
-    result = _re2.sub(r'([a-h][1-8])', lambda m: _sq_he(m.group(1)), result)
 
     # 1. Template patterns (dynamic sentences)
     for (pat, keys), heb in _COMPILED_TEMPLATES:
@@ -430,10 +418,9 @@ class ChessUltimate:
         self.theory_arrows    = []            # list of (from_sq, to_sq, color) for theory display
 
         # ── Clocks ────────────────────────────────────────────────────────────
-        self.white_time   = 600.0
-        self.black_time   = 600.0
-        self.last_tick    = time.time()
-        self.clock_paused = False   # True while engine/coach is thinking
+        self.white_time = 600.0
+        self.black_time = 600.0
+        self.last_tick  = time.time()
 
         # ── Speech — Hebrew TTS via edge_tts ─────────────────────────────────
         # NOTE: SpeechManager must be created AFTER init_engine()
@@ -701,7 +688,7 @@ class ChessUltimate:
         dt  = now - self.last_tick
         self.last_tick = now
 
-        if not self.board.is_game_over() and not self.review_mode and not self.clock_paused:
+        if not self.board.is_game_over() and not self.review_mode:
             if self.board.turn == chess.WHITE:
                 self.white_time = max(0.0, self.white_time - dt)
             else:
@@ -896,11 +883,6 @@ class ChessUltimate:
     PIECE_NAME = {
         chess.PAWN: "pawn", chess.KNIGHT: "knight", chess.BISHOP: "bishop",
         chess.ROOK: "rook", chess.QUEEN: "queen", chess.KING: "king"
-    }
-    # Hebrew piece names — used only for speech in _why_better
-    PIECE_NAME_HE = {
-        chess.PAWN: "רגלי", chess.KNIGHT: "פרש", chess.BISHOP: "רץ",
-        chess.ROOK: "צריח", chess.QUEEN: "מלכה", chess.KING: "מלך"
     }
 
     def toggle_coach(self):
@@ -1180,12 +1162,13 @@ class ChessUltimate:
 
     def _why_better(self, best: chess.Move, best_piece, board: chess.Board,
                     board_after: chess.Board) -> str:
-        """Return a Hebrew reason why the best move is better."""
+        """Return a detailed plain-English reason why the best move is better."""
         to_sq    = best.to_square
         from_sq  = best.from_square
         to_file  = chess.square_file(to_sq)
+        to_rank  = chess.square_rank(to_sq)
         to_name  = chess.square_name(to_sq)
-        bp_name  = self.PIECE_NAME_HE.get(best_piece.piece_type, "כלי")
+        bp_name  = self.PIECE_NAME.get(best_piece.piece_type, "piece")
         move_num = len(board.move_stack)
 
         central      = {chess.D4, chess.D5, chess.E4, chess.E5}
@@ -1200,70 +1183,72 @@ class ChessUltimate:
 
         # ── Checkmate ─────────────────────────────────────────────────────────
         if board_after_best.is_checkmate():
-            return "זה שח-מט — המשחק היה נגמר מיד! תמיד חפש מט!"
+            return f"That move is CHECKMATE — the game would be over immediately! Always look for the King hunt!"
 
         # ── Check ─────────────────────────────────────────────────────────────
         if board_after_best.is_check():
-            reasons.append("זה נותן שח למלך היריב ומכריח אותו להגיב")
+            reasons.append(f"it puts the opponent's King in check, forcing them to deal with the threat instead of developing their own attack")
 
         # ── Capture ───────────────────────────────────────────────────────────
         captured = board.piece_at(to_sq)
         if captured:
-            cap_name = self.PIECE_NAME_HE.get(captured.piece_type, "כלי")
+            cap_name = self.PIECE_NAME.get(captured.piece_type, "piece")
             cap_val  = self.PIECE_VALUE.get(captured.piece_type, 0)
             mv_val   = self.PIECE_VALUE.get(best_piece.piece_type, 0)
             if cap_val > mv_val:
                 diff = cap_val - mv_val
-                reasons.append(f"זה לוכד את ה{cap_name} של היריב בחינם — אתה מרוויח {diff} נקודות יתרון")
+                reasons.append(f"it captures the opponent's {cap_name} for free — you gain {diff} points of material advantage")
             elif cap_val == mv_val:
-                reasons.append(f"זה לוכד את ה{cap_name} של היריב בחילוף שווה")
+                reasons.append(f"it captures the opponent's {cap_name} in an even exchange — keeping material balanced")
             else:
-                reasons.append("זה לוכד כלי ומוריד אותו מהלוח")
+                reasons.append(f"it captures a piece, removing it from the board")
 
-        # ── Fork ──────────────────────────────────────────────────────────────
+        # ── Fork (attacks two pieces at once) ────────────────────────────────
         attacked_pieces = []
         for sq in chess.SQUARES:
             p = board_after_best.piece_at(sq)
             if p and p.color == chess.BLACK and p.piece_type != chess.KING:
                 if board_after_best.is_attacked_by(chess.WHITE, sq):
-                    attacked_pieces.append(self.PIECE_NAME_HE.get(p.piece_type, "כלי"))
+                    attacked_pieces.append(self.PIECE_NAME.get(p.piece_type, "piece"))
         if len(attacked_pieces) >= 2:
-            reasons.append(f"זה מזלג — תוקף את ה{attacked_pieces[0]} וה{attacked_pieces[1]} בו זמנית, הם יכולים להציל רק אחד!")
+            reasons.append(f"it forks the opponent — attacking their {attacked_pieces[0]} and {attacked_pieces[1]} at the same time, and they can only save one!")
 
-        # ── Attacks undefended piece ──────────────────────────────────────────
+        # ── Attacks a valuable undefended piece ───────────────────────────────
         elif attacked_pieces:
             for sq in chess.SQUARES:
                 p = board_after_best.piece_at(sq)
                 if p and p.color == chess.BLACK:
                     if board_after_best.is_attacked_by(chess.WHITE, sq):
                         defenders = board_after_best.attackers(chess.BLACK, sq)
-                        pname = self.PIECE_NAME_HE.get(p.piece_type, "כלי")
+                        pname = self.PIECE_NAME.get(p.piece_type, "piece")
                         pval  = self.PIECE_VALUE.get(p.piece_type, 0)
                         mv_val = self.PIECE_VALUE.get(best_piece.piece_type, 0)
                         if not defenders:
-                            reasons.append(f"זה תוקף את ה{pname} הלא מוגן של היריב על {chess.square_name(sq)}")
+                            reasons.append(f"it attacks the opponent's undefended {pname} on {chess.square_name(sq)} — they must move it or lose it")
                         elif pval > mv_val:
-                            reasons.append(f"זה מאיים על ה{pname} של היריב על {chess.square_name(sq)} שווה יותר מה{bp_name} שלך")
+                            reasons.append(f"it threatens to win the opponent's {pname} on {chess.square_name(sq)} which is worth more than your {bp_name}")
                         break
 
         # ── Central control ───────────────────────────────────────────────────
         if to_sq in central:
-            reasons.append(f"ה{bp_name} על {to_name} שולט במרכז ומשפיע על שני צידי הלוח")
+            controlled = len([sq for sq in chess.SQUARES
+                              if board_after_best.is_attacked_by(chess.WHITE, sq)])
+            reasons.append(f"placing your {bp_name} on {to_name} gives it maximum reach — central pieces control the most squares and influence both sides of the board")
         elif to_sq in near_centre and best_piece.piece_type in (chess.KNIGHT, chess.BISHOP):
-            reasons.append(f"{to_name} היא עמדה חזקה קרוב למרכז עם השפעה רבה")
+            reasons.append(f"{to_name} is a strong outpost near the centre, giving your {bp_name} excellent influence over the key squares")
 
-        # ── Development ───────────────────────────────────────────────────────
+        # ── Development (opening principles) ─────────────────────────────────
         if move_num <= 14 and chess.square_rank(from_sq) == 0:
             if best_piece.piece_type == chess.KNIGHT:
-                sq_ctrl = len(list(board_after_best.attacks(to_sq)))
-                reasons.append(f"זה מפתח את הפרש ושולט ב{sq_ctrl} משבצות — בפתיחה חשוב לפתח כלים מהר")
+                squares_controlled = len(list(board_after_best.attacks(to_sq)))
+                reasons.append(f"it develops your Knight which now controls {squares_controlled} squares — in the opening, get your pieces off the back rank as quickly as possible")
             elif best_piece.piece_type == chess.BISHOP:
-                diag = len(list(board_after_best.attacks(to_sq)))
-                reasons.append(f"זה מפעיל את הרץ עם אלכסון השולט ב{diag} משבצות")
+                diagonal_len = len(list(board_after_best.attacks(to_sq)))
+                reasons.append(f"it activates your Bishop with a diagonal controlling {diagonal_len} squares — Bishops become much stronger when they have open diagonals")
 
         # ── King safety ───────────────────────────────────────────────────────
         if best_piece.piece_type == chess.KING and board.is_castling(best):
-            reasons.append("הצרחה מגנה על המלך מאחורי הרגלים ומחברת את הצריחים")
+            reasons.append("castling tucks your King safely behind your pawns and connects your Rooks — two important goals in one move!")
 
         # ── Rook on open file ─────────────────────────────────────────────────
         if best_piece.piece_type == chess.ROOK:
@@ -1272,27 +1257,27 @@ class ChessUltimate:
                          board_after_best.piece_at(sq).piece_type == chess.PAWN and
                          chess.square_file(sq) == to_file]
             if not file_pawns:
-                reasons.append(f"זה מציב את הצריח על קו פתוח — הצריח הכי חזק על קווים פתוחים")
+                reasons.append(f"it places your Rook on an open file with no pawns blocking it — Rooks are most powerful on open files where they can attack freely")
 
-        # ── Piece activity ────────────────────────────────────────────────────
+        # ── Piece activity comparison ─────────────────────────────────────────
         if not reasons:
-            my_before = len(list(board.attacks(from_sq)))
-            my_after  = len(list(board_after_best.attacks(to_sq)))
-            if my_after > my_before:
-                diff = my_after - my_before
-                reasons.append(f"ה{bp_name} שולט ב{diff} משבצות יותר מ{to_name} — כלים פעילים נותנים יותר אפשרויות")
+            my_squares_before = len(list(board.attacks(from_sq)))
+            my_squares_after  = len(list(board_after_best.attacks(to_sq)))
+            if my_squares_after > my_squares_before:
+                diff = my_squares_after - my_squares_before
+                reasons.append(f"your {bp_name} controls {diff} more squares from {to_name} than where it was — more active pieces give you more options every turn")
             elif best_piece.piece_type == chess.QUEEN:
-                reasons.append(f"המלכה ממוקמת טוב יותר וקשה לתקוף אותה מ{to_name}")
+                reasons.append(f"the Queen is more centralised and harder to attack from {to_name}")
             else:
-                reasons.append(f"ה{bp_name} פשוט פעיל ומוצב טוב יותר על {to_name}")
+                reasons.append(f"your {bp_name} is simply more active and better placed on {to_name}")
 
         if reasons:
             if len(reasons) == 1:
-                return f"{reasons[0]}."
+                return f"Because {reasons[0]}."
             else:
-                return f"{reasons[0]}, וגם {reasons[1]}."
+                return f"Because {reasons[0]}, and also {reasons[1]}."
 
-        return "זה נותן לכלי שלך תפקיד פעיל ומשפיע יותר במשחק."
+        return "It gives your piece a more active and influential role in the position."
 
     def draw_coach_highlight(self):
         """Draw green arrow/highlight for the suggested best move."""
@@ -1415,7 +1400,6 @@ class ChessUltimate:
         self.redraw()
 
         self.status_var.set("Engine thinking…")
-        self.clock_paused = True   # pause while engine+coach thinks
 
         if self.board.is_game_over():
             self.handle_end()
@@ -1582,6 +1566,11 @@ class ChessUltimate:
 
                 self.root.after(0, self.update_board)
 
+                self.speak_async(f"Computer plays {move_san}")
+
+                if self.board.is_check():
+                    self.speak_async("Check!")
+
         except Exception as e:
             print("Engine crashed:", e)
 
@@ -1600,10 +1589,8 @@ class ChessUltimate:
         self.opening_label.config(text=detect_opening(self.board))
         self.redraw()
         self.speak(san)
+        time.sleep(0.2)
         winsound.Beep(600 if is_capture else 1000, 50)
-
-        self.clock_paused = False  # resume — player's turn
-        self.last_tick = time.time()  # reset tick to avoid jump
 
         if self.board.is_game_over():
             result = self.board.result()
@@ -1782,14 +1769,11 @@ class ChessUltimate:
     # ──────────────────────────────────────────────────────────────────────────
     def speak(self, text: str):
         """Announce a chess SAN move in Hebrew."""
-        import re as _re3
         readable = (text
                     .replace('N', 'פרש').replace('B', 'רץ')
                     .replace('R', 'צריח').replace('Q', 'מלכה')
                     .replace('K', 'מלך').replace('x', 'לוכד')
                     .replace('+', 'שח').replace('#', 'שח-מט'))
-        # Translate square names (e4 -> אי ארבע)
-        readable = _re3.sub(r'([a-h][1-8])', lambda m: _sq_he(m.group(1)), readable)
         self._tts.speak(readable)
 
     def coach_speak(self, text: str):
@@ -1898,42 +1882,43 @@ class ChessUltimate:
         self.redraw()
 
     def _explain_theory_move(self, san: str, opening_name: str) -> str:
-        """Return a short explanation of why this theory move is played — Hebrew for speech."""
+        """Return a short human explanation of why this theory move is played."""
         san_clean = san.replace("x","").replace("+","").replace("#","")
 
+        # Central pawn moves
         if san_clean in ("e4", "e5", "d4", "d5"):
-            return "שולט במרכז — עיקרון הפתיחה החשוב ביותר."
+            return "  Why: Controls the centre — the most important opening principle."
         if san_clean in ("c4", "c5"):
-            return "נלחם על שטח מרכזי מהאגף."
+            return "  Why: Fights for central space from the flank."
         if san_clean in ("Nf3", "Nc3", "Nf6", "Nc6"):
-            return "מפתח פרש למרכז — פעיל וגמיש."
+            return "  Why: Develops a knight toward the centre — active and flexible."
         if san_clean in ("Bb5", "Bc4", "Bb4", "Bc5", "Bg5", "Bf4", "Be3"):
-            return "מפתח רץ לאלכסון פעיל."
+            return "  Why: Develops a bishop to an active diagonal, eyeing key squares."
         if san_clean in ("O-O", "O-O-O"):
-            return "מצריח את המלך לבטיחות ומחבר צריחים."
+            return "  Why: Castles the King to safety and connects the rooks."
         if san_clean in ("d6", "e6"):
-            return "תומך במרכז ומכין פיתוח כלים."
+            return "  Why: Supports the centre and prepares piece development."
         if san_clean in ("a6",):
-            return "עוצר רץ על b5 ומכין התרחבות בצד המלכה."
+            return "  Why: Stops Bb5, prepares queenside expansion (Najdorf idea)."
         if san_clean in ("g6",):
-            return "מכין פיאנקטו לרץ על g7 ששולט באלכסון הארוך."
+            return "  Why: Prepares to fianchetto the bishop to g7, controlling the long diagonal."
         if san_clean in ("cxd4", "exd4"):
-            return "פותח את המרכז ופותח קווים לכלים."
+            return "  Why: Opens the centre, gains space, and opens lines for pieces."
         if san_clean in ("Nxd4",):
-            return "לוכד חזרה במרכז עם מבנה רגלים חזק."
+            return "  Why: Recaptures in the centre, keeping a strong pawn structure."
         if san_clean in ("c3",):
-            return "תומך ברגלי המרכז ומכין d4."
+            return "  Why: Supports the centre pawn and prepares d4."
         if san_clean in ("f4", "f5"):
-            return "אגרסיבי — תופס שטח ומכין מתקפת צד מלך."
-        if "Sicilian" in opening_name:
-            return "חלק מהסיציליאנית — השחור נלחם על המרכז בצורה אסימטרית."
+            return "  Why: Aggressive — grabs space and prepares kingside attack."
+        if "opening_name" and "Sicilian" in opening_name:
+            return "  Why: Part of the Sicilian — Black fights for the centre asymmetrically."
         if "Ruy" in opening_name or "Lopez" in opening_name:
-            return "חלק מהרוי לופז — הלבן לוחץ על רגלי e5 בעקיפין."
+            return "  Why: Part of the Ruy Lopez — White pressures the e5 pawn indirectly."
         if "Italian" in opening_name:
-            return "חלק מהאיטלקית — שני הצדדים מתפתחים מהר למרכז."
+            return "  Why: Part of the Italian — both sides develop quickly toward the centre."
         if "London" in opening_name:
-            return "חלק ממערכת לונדון — פיתוח יציב ואמין."
-        return "מהלך תיאוריה סטנדרטי המשפר את פעילות הכלים."
+            return "  Why: Part of the London System — solid, reliable development."
+        return "  Why: A standard theory move improving piece activity."
 
     def __del__(self):
         if self.engine:
@@ -1948,6 +1933,15 @@ if __name__ == "__main__":
     root = tk.Tk()
     app  = ChessUltimate(root)
     root.mainloop()
+
+
+
+
+
+
+
+
+
 
 
 

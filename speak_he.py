@@ -292,21 +292,9 @@ _COMPILED_TEMPLATES = [
 ]
 
 
-def _sq_he(sq: str) -> str:
-    """Translate a chess square name (e4, f3...) to Hebrew pronunciation."""
-    FILES = {'a':'איי','b':'בי','c':'סי','d':'די','e':'אי','f':'אף','g':"ג'י",'h':"אייץ'"}
-    RANKS = {'1':'אחת','2':'שתיים','3':'שלוש','4':'ארבע','5':'חמש','6':'שש','7':'שבע','8':'שמונה'}
-    if len(sq) == 2 and sq[0] in FILES and sq[1] in RANKS:
-        return f"{FILES[sq[0]]} {RANKS[sq[1]]}"
-    return sq
-
-
 def translate_to_hebrew(text: str) -> str:
     """Translate English speech text to Hebrew — used only for TTS, not display."""
-    import re as _re2
     result = text
-    # Translate square names first (e4->אי ארבע etc.) before other substitutions
-    result = _re2.sub(r'([a-h][1-8])', lambda m: _sq_he(m.group(1)), result)
 
     # 1. Template patterns (dynamic sentences)
     for (pat, keys), heb in _COMPILED_TEMPLATES:
@@ -1782,14 +1770,11 @@ class ChessUltimate:
     # ──────────────────────────────────────────────────────────────────────────
     def speak(self, text: str):
         """Announce a chess SAN move in Hebrew."""
-        import re as _re3
         readable = (text
                     .replace('N', 'פרש').replace('B', 'רץ')
                     .replace('R', 'צריח').replace('Q', 'מלכה')
                     .replace('K', 'מלך').replace('x', 'לוכד')
                     .replace('+', 'שח').replace('#', 'שח-מט'))
-        # Translate square names (e4 -> אי ארבע)
-        readable = _re3.sub(r'([a-h][1-8])', lambda m: _sq_he(m.group(1)), readable)
         self._tts.speak(readable)
 
     def coach_speak(self, text: str):
@@ -1906,7 +1891,7 @@ class ChessUltimate:
         if san_clean in ("c4", "c5"):
             return "נלחם על שטח מרכזי מהאגף."
         if san_clean in ("Nf3", "Nc3", "Nf6", "Nc6"):
-            return "מפתח פרש למרכז — פעיל וגמיש."
+            return "מפתח פארש למרכז — פעיל וגמיש."
         if san_clean in ("Bb5", "Bc4", "Bb4", "Bc5", "Bg5", "Bf4", "Be3"):
             return "מפתח רץ לאלכסון פעיל."
         if san_clean in ("O-O", "O-O-O"):
